@@ -5,6 +5,7 @@
     Unit tests for gluon.html
 """
 
+import io
 import re
 import unittest
 
@@ -16,10 +17,11 @@ from gluon.html import (ASSIGNJS, BEAUTIFY, BODY, BR, BUTTON, CAT, CENTER,
                         OBJECT, OL, OPTGROUP, OPTION, PRE, SCRIPT, SELECT,
                         SPAN, STRONG, STYLE, TABLE, TAG, TBODY, TD, TEXTAREA,
                         TFOOT, TH, THEAD, TITLE, TR, TT, UL, URL, XHTML, XML,
-                        A, B, I, P, TAG_pickler, TAG_unpickler, XML_pickle,
+                        A, B, I, P, SAFEJSON, SafeString, TAG_pickler, TAG_unpickler, XML_pickle,
                         XML_unpickle, truncate_string, verifyURL,
                         web2pyHTMLParser, xmlescape)
 from gluon.storage import Storage
+from gluon.globals import current, Request, Response
 
 
 class TestBareHelpers(unittest.TestCase):
@@ -398,6 +400,93 @@ class TestBareHelpers(unittest.TestCase):
         self.assertEqual(CAT().xml(), "")
         # CAT('')
         self.assertEqual(CAT("").xml(), "")
+
+    def test_csp_nonce_injection(self):
+        # setup request/response
+        current.request = Request(env={})
+        current.request.application = "a"
+        current.response = Response()
+
+        # no nonce when CSP not enabled
+        s = SCRIPT('alert(1)')
+        self.assertNotIn('nonce="', s.xml())
+        st = STYLE('body { color: red }')
+        self.assertNotIn('nonce="', st.xml())
+
+        # include_files without CSP shouldn't add nonce
+        current.response.files = []
+        current.response.body = Storage()
+        # use existing pattern from other tests: append URL
+        current.response.files.append(URL("a", "static", "css/file.css"))
+        # clear body and call include_files
+        current.response.body = io.StringIO()
+        current.response.include_files()
+        content = current.response.body.getvalue()
+        self.assertNotIn('nonce="', content)
+
+        # enable CSP and check nonce appears in SCRIPT and STYLE
+        current.response = Response()
+        current.request = Request(env={})
+        current.request.application = "a"
+        current.response.enable_csp()
+
+        s = SCRIPT('console.log(1)')
+        self.assertIn('nonce="%s"' % current.response.nonce, s.xml())
+        st = STYLE('body { color: blue }')
+        self.assertIn('nonce="%s"' % current.response.nonce, st.xml())
+
+        # include_files should inject nonce into link when enabled
+        current.response.files = []
+        current.response.files.append(URL("a", "static", "css/file.css"))
+        current.response.body = io.StringIO()
+        current.response.include_files()
+        content = current.response.body.getvalue()
+        self.assertIn('nonce="%s"' % current.response.nonce, content)
+        # nonce must appear as a proper attribute, not mangled into "/>"
+        # e.g. '<link ... / nonce="x">' would be invalid HTML
+        self.assertNotIn('/ nonce=', content)
+        self.assertIn('/>', content)
+
+        # same check for .less files
+        current.response.files = []
+        current.response.files.append(URL("a", "static", "css/file.less"))
+        current.response.body = io.StringIO()
+        current.response.include_files()
+        less_content = current.response.body.getvalue()
+        self.assertIn('nonce="%s"' % current.response.nonce, less_content)
+        self.assertNotIn('/ nonce=', less_content)
+        self.assertIn('/>', less_content)
+
+        # .js files should also get a nonce
+        current.response.files = []
+        current.response.files.append(URL("a", "static", "js/file.js"))
+        current.response.body = io.StringIO()
+        current.response.include_files()
+        js_content = current.response.body.getvalue()
+        self.assertIn('nonce="%s"' % current.response.nonce, js_content)
+
+        # extra policies are merged alongside the nonce
+        current.response = Response()
+        current.request = Request(env={})
+        current.request.application = "a"
+        current.response.enable_csp(script_src="'unsafe-inline'")
+        csp = current.response.headers["Content-Security-Policy"]
+        self.assertIn("'nonce-%s'" % current.response.nonce, csp)
+        self.assertIn("'unsafe-inline'", csp)
+        # nonce is still injected into SCRIPT tags
+        self.assertIn('nonce="%s"' % current.response.nonce, SCRIPT('alert(1)').xml())
+
+        # pre-existing CSP header is merged, not overwritten
+        current.response = Response()
+        current.request = Request(env={})
+        current.request.application = "a"
+        current.response.headers["Content-Security-Policy"] = "img-src 'self' https://cdn.example.com"
+        current.response.enable_csp()
+        csp = current.response.headers["Content-Security-Policy"]
+        self.assertIn("img-src", csp)
+        self.assertIn("https://cdn.example.com", csp)
+        self.assertIn("'nonce-%s'" % current.response.nonce, csp)
+
         # CAT(' ')
         self.assertEqual(CAT(" ").xml(), " ")
 
@@ -922,6 +1011,13 @@ class TestBareHelpers(unittest.TestCase):
         # TODO check tags content
         self.assertEqual(len(FORM("<>", _a="1", _b="2").as_xml()), 326)
 
+    def test_FORM_add_button_escapes_redirect_url(self):
+        form = FORM(INPUT(_type="submit", _value="Go"))
+        form.add_button("Cancel", "/path?x=bar'")
+        html = form.xml()
+        self.assertIn('window.location=&quot;/path?x=bar&#x27;&quot;;return false', html)
+        self.assertNotIn("window.location='", html)
+
     def test_BEAUTIFY(self):
         # self.assertEqual(BEAUTIFY(['a', 'b', {'hello': 'world'}]).xml(),
         #                 '<div><table><tr><td><div>a</div></td></tr><tr><td><div>b</div></td></tr><tr><td><div><table><tr><td style="font-weight:bold;vertical-align:top;">hello</td><td style="vertical-align:top;">:</td><td><div>world</div></td></tr></table></div></td></tr></table></div>')
@@ -1024,6 +1120,43 @@ class TestBareHelpers(unittest.TestCase):
             "<code class=\"python\">hello_world = 'Hello World!'</code>",
         )
         self.assertEqual(MARKMIN("<>").flatten(), "<>")
+        
+        # Test XSS protection: javascript: URLs must be blocked
+        # Regression test for is_unsafe() function with HTML5 whitespace handling
+        # Block basic javascript: URLs in MARKMIN syntax
+        output = MARKMIN("[[link javascript:alert(1)]]").xml()
+        self.assertIn("markmin_unsafe", output)
+        self.assertNotIn("<a href=\"javascript:", output)
+        
+        # Allow safe HTTP URLs
+        output = MARKMIN("[[link http://example.com]]").xml()
+        self.assertIn('<a href="http://example.com"', output)
+        self.assertNotIn("markmin_unsafe", output)
+    
+    def test_MARKMIN_is_unsafe_whitespace_bypass(self):
+        # Test that the is_unsafe() function properly handles HTML5 whitespace
+        # This tests the fix for whitespace bypass in javascript: protocol detection
+        from gluon.contrib.markmin.markmin2html import is_unsafe
+        
+        # Basic javascript: should be detected
+        self.assertTrue(is_unsafe("javascript:alert(1)"))
+        
+        # javascript: with newline should be detected (HTML5 whitespace bypass prevention)
+        self.assertTrue(is_unsafe("java\nscript:alert(1)"))
+        
+        # javascript: with tab should be detected
+        self.assertTrue(is_unsafe("java\tscript:alert(1)"))
+        
+        # javascript: with form feed should be detected
+        self.assertTrue(is_unsafe("java\fscript:alert(1)"))
+        
+        # javascript: with carriage return should be detected
+        self.assertTrue(is_unsafe("java\rscript:alert(1)"))
+        
+        # Safe URLs should not be detected as unsafe
+        self.assertFalse(is_unsafe("http://example.com"))
+        self.assertFalse(is_unsafe("https://example.com"))
+        self.assertFalse(is_unsafe("mailto:test@example.com"))
 
     def test_ASSIGNJS(self):
         # empty assignation
@@ -1032,6 +1165,16 @@ class TestBareHelpers(unittest.TestCase):
         self.assertEqual(ASSIGNJS(var1="1").xml(), 'var var1 = "1";\n')
         # int assignation
         self.assertEqual(ASSIGNJS(var2=2).xml(), "var var2 = 2;\n")
+
+    def test_SAFEJSON(self):
+        obj = {"x": "</script><img src=x onerror=alert(1)>"}
+        s = SAFEJSON(obj)
+        assert isinstance(s, SafeString)
+        xml = s.xml()
+        # ensure raw '</' does not appear
+        assert "</" not in xml
+        # ensure we used the unicode-escaped form
+        assert "\\u003c/" in xml
 
 
 class TestData(unittest.TestCase):
