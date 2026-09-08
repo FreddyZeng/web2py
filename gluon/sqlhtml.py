@@ -24,7 +24,7 @@ from urllib.parse import quote as urllib_quote
 from urllib.parse import unquote as urllib_unquote
 from urllib.parse import urlencode
 
-from pydal.adapters.base import CALLABLETYPES
+from pydal.backend_base import CALLABLETYPES
 from pydal.base import DEFAULT
 from pydal.default_validators import default_validators
 from pydal.helpers.classes import Reference, SQLCustomType
@@ -67,9 +67,9 @@ from gluon.html import (
     XmlComponent,
     truncate_string,
 )
-from gluon.http import HTTP, redirect
+from gluon.http import HTTP, content_disposition_header, redirect
 from gluon.storage import Storage
-from gluon.utils import md5_hash
+from gluon.utils import csv_safe_text, md5_hash
 from gluon.validators import (
     IS_DATE,
     IS_DATETIME,
@@ -2872,6 +2872,15 @@ class SQLFORM(FORM):
                             f.tablename = table._tablename
                             fields.append(f)
                             columns.append(f)
+        # the grid only offers sort links for readable, non-virtual columns;
+        # request.vars.order must be constrained to that same set so a crafted
+        # value cannot order by (and leak the ordering of) an undisplayed column
+        # or reference an unrelated table and raise an unhandled 500
+        sortable_fields = set(
+            str(f)
+            for f in columns
+            if isinstance(f, Field) and not isinstance(f, Field.Virtual) and f.readable
+        )
         if not field_id:
             if groupby is None:
                 field_id = tables[0]._id
@@ -2929,6 +2938,8 @@ class SQLFORM(FORM):
         create_form = update_form = view_form = search_form = None
 
         if create and request.args(-2) == "new":
+            if request.args[-1] not in tablenames:
+                redirect(referrer)
             table = db[request.args[-1]]
             sqlformargs = dict(
                 ignore_rw=ignore_rw, formstyle=formstyle, _class="web2py_form"
@@ -2952,6 +2963,8 @@ class SQLFORM(FORM):
             return res
 
         elif details and request.args(-3) == "view":
+            if request.args[-2] not in tablenames:
+                redirect(referrer)
             table = db[request.args[-2]]
             record = table(request.args[-1]) or redirect(referrer)
             if represent_none is not None:
@@ -2981,6 +2994,8 @@ class SQLFORM(FORM):
             res.rows = None
             return res
         elif editable and request.args(-3) == "edit":
+            if request.args[-2] not in tablenames:
+                redirect(referrer)
             table = db[request.args[-2]]
             record = table(request.args[-1]) or redirect(URL("error"))
             deletable_ = deletable(record) if callable(deletable) else deletable
@@ -3016,6 +3031,8 @@ class SQLFORM(FORM):
             res.rows = None
             return res
         elif deletable and request.args(-3) == "delete":
+            if request.args[-2] not in tablenames:
+                redirect(referrer)
             table = db[request.args[-2]]
             if not callable(deletable):
                 if ondelete:
@@ -3087,7 +3104,7 @@ class SQLFORM(FORM):
         if export_type:
             order = request.vars.order or ""
             if sortable:
-                if order:
+                if order and order.split("~")[-1] in sortable_fields:
                     otablename, ofieldname = order.split("~")[-1].split(".", 1)
                     sort_field = db[otablename][ofieldname]
                     orderby = sort_field if order[:1] != "~" else ~sort_field
@@ -3157,10 +3174,15 @@ class SQLFORM(FORM):
                 rows.colnames = expcolumns
                 oExp = clazz(rows)
                 export_filename = request.vars.get("_export_filename") or "rows"
-                filename = ".".join((export_filename, oExp.file_ext))
+                # `_export_filename` is taken verbatim from the query string.
+                # Concatenating it raw into Content-Disposition let an
+                # attacker inject extra directives (e.g. a second `filename=`)
+                # by submitting `_export_filename=a";filename=evil.exe`. The
+                # http layer only strips CR/LF, so `"` and `;` would survive.
+                # Reuse the shared Content-Disposition filename helper.
                 response.headers["Content-Type"] = oExp.content_type
-                response.headers["Content-Disposition"] = (
-                    "attachment;filename=" + filename + ";"
+                response.headers["Content-Disposition"] = content_disposition_header(
+                    "%s.%s" % (export_filename, oExp.file_ext)
                 )
                 raise HTTP(200, oExp.export(), **response.headers)
 
@@ -3263,7 +3285,7 @@ class SQLFORM(FORM):
         order = request.vars.order or ""
         asc_icon, desc_icon = sorter_icons
         if sortable:
-            if order:
+            if order and order.split("~")[-1] in sortable_fields:
                 otablename, ofieldname = order.split("~")[-1].split(".", 1)
                 sort_field = db[otablename][ofieldname]
                 orderby = sort_field if order[:1] != "~" else ~sort_field
@@ -4397,7 +4419,7 @@ class ExporterTSV(ExportClass):
             self.rows.export_to_csv_file(
                 s, represent=True, delimiter="\t", newline="\n"
             )
-            return s.getvalue()
+            return csv_safe_text(s.getvalue(), delimiter="\t")
         else:
             return None
 
@@ -4414,7 +4436,7 @@ class ExporterTSV_hidden(ExportClass):
         if self.rows:
             s = io.StringIO()
             self.rows.export_to_csv_file(s, delimiter="\t", newline="\n")
-            return s.getvalue()
+            return csv_safe_text(s.getvalue(), delimiter="\t")
         else:
             return None
 
@@ -4432,7 +4454,7 @@ class ExporterCSV(ExportClass):
         if self.rows:
             s = io.StringIO()
             self.rows.export_to_csv_file(s, represent=True)
-            return s.getvalue()
+            return csv_safe_text(s.getvalue())
         else:
             return None
 
@@ -4448,7 +4470,7 @@ class ExporterCSV_hidden(ExportClass):
 
     def export(self):
         if self.rows:
-            return self.rows.as_csv()
+            return csv_safe_text(self.rows.as_csv())
         else:
             return ""
 

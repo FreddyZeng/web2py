@@ -151,8 +151,12 @@ class Collection(object):
             if hasattr(field, "regexp_validator"):
                 info["regexp"] = field.regexp_validator
             info["required"] = field.required
-            info["post_writable"] = field.name in policies["POST"].get("fields", fields)
-            info["put_writable"] = field.name in policies["PUT"].get("fields", fields)
+            info["post_writable"] = field.writable and field.name in policies[
+                "POST"
+            ].get("fields", fields)
+            info["put_writable"] = field.writable and field.name in policies[
+                "PUT"
+            ].get("fields", fields)
             info["options"] = {}  # FIX THIS
             data.append(info)
         return {"data": data}
@@ -162,10 +166,15 @@ class Collection(object):
         if len(self.request.args) > 1:
             vars.id = self.request.args[1]
 
-        fieldnames = table.fields
+        # only fields the policy exposes may be filtered/ordered on. These are
+        # the same fields table2queries() advertises as searchable; the request
+        # must not reach beyond them to non-exposed columns (e.g. password),
+        # otherwise the items_found count and _orderby leak those values.
+        fieldnames = self.table_policy.get("fields", table.fields)
         queries = [table]
         limitby = [0, self.MAXITEMS + 1]
         orderby = "id"
+        orderby_from_vars = False
         for key, value in vars.items():
             if key == "_offset":
                 limitby[0] = int(value)  # MAY FAIL
@@ -173,6 +182,7 @@ class Collection(object):
                 limitby[1] = int(value) + 1  # MAY FAIL
             elif key == "_orderby":
                 orderby = value
+                orderby_from_vars = True
             elif key in fieldnames:
                 queries.append(table[key] == value)
             elif (
@@ -201,8 +211,13 @@ class Collection(object):
         query = (
             reduce(lambda a, b: a & b, queries[1:]) if len(queries) > 1 else queries[0]
         )
+        orderby_names = orderby.split(",")
+        if orderby_from_vars:
+            for f in orderby_names:
+                if (f[1:] if f[:1] == "~" else f) not in fieldnames:
+                    raise ValueError("Invalid Query")
         orderby = [
-            table[f] if f[0] != "~" else ~table[f[1:]] for f in orderby.split(",")
+            table[f] if f[0] != "~" else ~table[f[1:]] for f in orderby_names
         ]
         return (query, limitby, orderby)
 
@@ -342,13 +357,16 @@ class Collection(object):
                     (query, limitby, orderby) = self.request2query(
                         table, request.get_vars
                     )
+                    allowed = self.table_policy.get("fields", table.fields)
                     fields = filter(
-                        lambda fn_value: table[fn_value[0]].writable, data.items()
+                        lambda fn_value: fn_value[0] in allowed
+                        and table[fn_value[0]].writable,
+                        data.items(),
                     )
                     res = db(query).validate_and_update(**dict(fields))  # MAY FAIL
-                    if res.errors:
+                    if res["errors"]:
                         return self.error(
-                            400, "BAD REQUEST", "Validation Error", res.errors
+                            400, "BAD REQUEST", "Validation Error", res["errors"]
                         )
                     else:
                         response.status = 200
@@ -359,18 +377,21 @@ class Collection(object):
             else:  # create
                 # ADD validate fields and return error
                 try:
+                    allowed = self.table_policy.get("fields", table.fields)
                     fields = filter(
-                        lambda fn_value1: table[fn_value1[0]].writable, data.items()
+                        lambda fn_value1: fn_value1[0] in allowed
+                        and table[fn_value1[0]].writable,
+                        data.items(),
                     )
                     res = table.validate_and_insert(**dict(fields))  # MAY FAIL
-                    if res.errors:
+                    if res["errors"]:
                         return self.error(
-                            400, "BAD REQUEST", "Validation Error", res.errors
+                            400, "BAD REQUEST", "Validation Error", res["errors"]
                         )
                     else:
                         response.status = 201
                         response.headers["location"] = URL(
-                            args=(tablename, res.id), scheme=True
+                            args=(tablename, res["id"]), scheme=True
                         )
                         return ""
                 except SyntaxError as e:  # Exception,e:

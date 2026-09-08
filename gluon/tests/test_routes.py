@@ -9,7 +9,13 @@ import unittest
 
 from gluon.html import URL
 from gluon.http import HTTP
-from gluon.rewrite import filter_err, filter_url, load, regex_filter_out
+from gluon.rewrite import (
+    filter_err,
+    filter_url,
+    load,
+    regex_filter_out,
+    try_redirect_on_error,
+)
 from gluon.settings import global_settings
 from gluon.storage import Storage
 
@@ -85,6 +91,18 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual(
             filter_url("http://domain.com/welcome/static/path/to/static"),
             norm_root("%s/applications/welcome/static/path/to/static" % root),
+        )
+        self.assertEqual(
+            filter_url("http://domain.com/welcome/static/css/deep/style.css"),
+            norm_root("%s/applications/welcome/static/css/deep/style.css" % root),
+        )
+        sibling_static = os.path.join(root, "applications", "welcome", "static_evil")
+        if not os.path.exists(sibling_static):
+            os.mkdir(sibling_static)
+        self.assertRaises(
+            HTTP,
+            filter_url,
+            "http://domain.com/welcome/static/_/../../static_evil/secret.txt",
         )
         # no more necessary since explcit check for directory traversal attacks
         """
@@ -226,6 +244,22 @@ default_application = 'defapp'
         self.assertEqual(filter_err(200), 200)
         self.assertEqual(filter_err(399), 399)
         self.assertEqual(filter_err(400), 400)
+
+    def test_routes_onerror_encodes_request_url(self):
+        """
+        request.url comes from PATH_INFO and must be percent-encoded before
+        it is embedded in the error-redirect URL, like requested_uri already is.
+        """
+        load(data="routes_onerror=[('*/*', '/app/default/error')]")
+        request = Storage()
+        request.application = "app"
+        request.url = '/app/x"onmouseover="alert(1)'
+        request.env = Storage(request_uri="/app/x%22onmouseover%3D%22alert(1)")
+        result = try_redirect_on_error(HTTP(404), request, ticket="tkt")
+        location = result.headers["Location"]
+        self.assertIn("request_url=%2Fapp%2Fx%22onmouseover", location)
+        self.assertNotIn('"', location)
+        self.assertNotIn('"onmouseover="alert(1)', result.body)
 
     def test_routes_args(self):
         """
@@ -491,3 +525,29 @@ routes_out = [
             filter_url("http://domain.com/index/a%20bc", env=True).request_uri,
             "/init/default/index/a bc",
         )
+
+    def test_static_traversal_prefix_sibling(self):
+        """A sibling directory whose name shares the 'static' prefix must
+        not be reachable from /<app>/static/... — the boundary check must
+        enforce a path-separator after the static root, not bare startswith.
+
+        REGEX_URL forces the first path segment after /<app>/static/ to
+        match \\w+, so the traversal is hidden behind a valid-looking
+        filename. Without an os.sep boundary in the safety check, the
+        abspath result <root>/applications/welcome/staticbackup/secret.txt
+        passes startswith(<root>/applications/welcome/static) and the
+        file is served outside the static root."""
+        load(data="")
+        sibling = os.path.join(root, "applications", "welcome", "staticbackup")
+        os.mkdir(sibling)
+        try:
+            with open(os.path.join(sibling, "secret.txt"), "w") as fp:
+                fp.write("secret")
+            self.assertRaises(
+                HTTP,
+                filter_url,
+                "http://domain.com/welcome/static/"
+                "x.txt/../../staticbackup/secret.txt",
+            )
+        finally:
+            shutil.rmtree(sibling)

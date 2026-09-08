@@ -13,9 +13,11 @@ This file specifically includes utilities for security.
 
 import ast
 import base64
+import csv
 import hashlib
 import hmac
 import inspect
+import io
 import logging
 import os
 import pickle
@@ -96,6 +98,62 @@ def compare(a, b):
 def md5_hash(text):
     """Generate an md5 hash with the given text."""
     return hashlib.md5(text.encode("utf8")).hexdigest()
+
+
+# Leading characters that make spreadsheet software (Excel, LibreOffice,
+# Google Sheets, ...) treat a CSV/TSV cell as a formula. A value beginning
+# with one of these can execute arbitrary spreadsheet expressions when the
+# exported file is opened -- this is "CSV/formula injection" (CWE-1236).
+CSV_INJECTION_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value):
+    """Neutralize a single CSV/TSV cell against formula injection.
+
+    A string cell that starts with a formula-triggering character is prefixed
+    with a single quote so spreadsheet software renders it as literal text.
+    Non-string values (numbers, dates, ...) are returned unchanged, so genuine
+    numeric cells such as ``-5`` keep their type and meaning.
+    """
+    if isinstance(value, str) and value.startswith(CSV_INJECTION_PREFIXES):
+        return "'" + value
+    return value
+
+
+def _csv_safe_cell_text(cell):
+    """:func:`csv_safe` for a cell that has already been stringified.
+
+    At the text level every cell is a string, so :func:`csv_safe` could no
+    longer tell a genuine negative/positive number (``-5``, ``+3.14``) from a
+    formula and would wrongly quote it. Numeric literals can never be formulas,
+    so they are left untouched; anything else starting with a formula-triggering
+    character is prefixed with a single quote.
+    """
+    if cell.startswith(CSV_INJECTION_PREFIXES):
+        try:
+            float(cell)
+        except ValueError:
+            return "'" + cell
+    return cell
+
+
+def csv_safe_text(text, delimiter=","):
+    """Neutralize already-serialized CSV/TSV text against formula injection.
+
+    Some export paths hand the row data to a writer we do not control (e.g.
+    pydal's ``Rows.export_to_csv_file``), so the cells cannot be passed through
+    :func:`csv_safe` individually. Re-parsing the produced text and re-emitting
+    every cell keeps the exact CSV structure (same delimiter, quoting and line
+    endings) while making dangerous cells render as literal text. ``text`` may be
+    empty/None, in which case it is returned as-is.
+    """
+    if not text:
+        return text
+    out = io.StringIO()
+    writer = csv.writer(out, delimiter=delimiter)
+    for row in csv.reader(io.StringIO(text), delimiter=delimiter):
+        writer.writerow([_csv_safe_cell_text(cell) for cell in row])
+    return out.getvalue()
 
 
 def get_callable_argspec(fn):
@@ -189,7 +247,12 @@ def secure_loads(
     components = data.count(b":")
     if components == 1:
         return secure_loads_deprecated(
-            data, encryption_key, hash_key, compression_level
+            data,
+            encryption_key,
+            hash_key,
+            compression_level,
+            safe_unpickle=safe_unpickle,
+            allowed_classes=allowed_classes,
         )
     if components != 2:
         return None
@@ -249,7 +312,12 @@ def secure_dumps_deprecated(
 
 
 def secure_loads_deprecated(
-    data, encryption_key, hash_key=None, compression_level=None
+    data,
+    encryption_key,
+    hash_key=None,
+    compression_level=None,
+    safe_unpickle=True,
+    allowed_classes=None,
 ):
     """loads signed data (deprecated because of incorrect padding)"""
     encryption_key = encryption_key.encode("utf8")
@@ -275,6 +343,10 @@ def secure_loads_deprecated(
         data = data.rstrip(b" ")
         if compression_level:
             data = zlib.decompress(data)
+        if safe_unpickle:
+            from gluon.restricted import safe_loads as safe_loads_restricted
+
+            return safe_loads_restricted(data, allowed_classes=allowed_classes)
         return pickle.loads(data)
     except Exception:
         return None
@@ -503,3 +575,141 @@ def safe_path_join(*paths):
     if not (result == root or result.startswith(root + os.sep)):
         raise ValueError("Unsafe path: %s is not inside %s" % (result, root))
     return result
+
+def safe_eval_expression(text, allowed_names=None):
+    """Security utilities for web2py.
+
+    This module provides a shared, hardened expression evaluator used by
+    appadmin to safely evaluate user-supplied query and orderby expressions.
+
+    Safely evaluate a Python expression with strict AST validation.
+
+    Blocks dangerous operations (function calls, comprehensions, imports,
+    dunder/private attributes, subscripting, and all statement nodes).
+
+    Args:
+        text (str): expression to evaluate
+        allowed_names (iterable|dict|set): names allowed in the expression
+
+    Returns:
+        The result of evaluating the expression in a tightly restricted namespace.
+
+    Raises:
+        ValueError: on unsafe constructs or evaluation failure
+    """
+    # Normalize allowed_names. If caller passed a mapping (e.g. databases)
+    # keep a reference to it (allowed_mapping) so we can populate the
+    # evaluation namespace only with explicitly allowed entries.
+    allowed_mapping = None
+    if allowed_names is None:
+        allowed_names = set()
+    elif isinstance(allowed_names, dict):
+        allowed_mapping = allowed_names
+        allowed_names = set(allowed_names.keys())
+    else:
+        allowed_names = set(allowed_names)
+
+    SAFE_FIELD_METHODS = frozenset({
+        "belongs", "like", "ilike", "startswith", "endswith",
+        "contains", "upper", "lower", "year", "month", "day",
+        "hour", "minutes", "seconds", "regexp",
+    })
+    # DAL Set methods (underscore-prefixed) allowed only when called on a chain
+    # rooted in a name from allowed_names (e.g. db()._select(...) is fine;
+    # untrusted_obj._select(...) is not).
+    SAFE_SET_METHODS = frozenset({"_select"})
+
+    def ast_root_name(node):
+        while True:
+            if isinstance(node, ast.Name):
+                return node.id
+            elif isinstance(node, ast.Attribute):
+                node = node.value
+            elif isinstance(node, ast.Call):
+                node = node.func
+            else:
+                return None
+
+    DANGEROUS_NODES = (
+        ast.Lambda,
+        ast.Subscript,
+        ast.ListComp,
+        ast.SetComp,
+        ast.DictComp,
+        ast.GeneratorExp,
+        ast.Import,
+        ast.ImportFrom,
+        ast.For,
+        ast.While,
+        ast.If,
+        ast.Try,
+        ast.With,
+        ast.Raise,
+        ast.Assert,
+        ast.Delete,
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.Assign,
+        ast.AugAssign,
+        ast.AnnAssign,
+        ast.Global,
+        ast.Nonlocal,
+        ast.Return,
+        ast.Yield,
+        ast.YieldFrom,
+        ast.Await,
+        ast.FormattedValue,
+        ast.JoinedStr,
+        ast.IfExp,            # ternary: a if b else c
+        ast.NamedExpr,        # walrus :=
+    )
+
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError as e:
+        raise ValueError("Invalid expression: %s" % str(e))
+
+    for node in ast.walk(tree):
+        if isinstance(node, DANGEROUS_NODES):
+            raise ValueError("unsafe appadmin expression")
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("_"):
+                if not (node.attr in SAFE_SET_METHODS
+                        and ast_root_name(node.value) in allowed_names):
+                    raise ValueError("unsafe appadmin expression")
+        if isinstance(node, ast.Name):
+            if node.id not in allowed_names:
+                raise ValueError("unsafe appadmin expression")
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                # e.g. db() — calling a trusted object directly
+                if func.id not in allowed_names:
+                    raise ValueError("unsafe appadmin expression")
+            elif isinstance(func, ast.Attribute):
+                if func.attr in SAFE_FIELD_METHODS:
+                    pass  # safe DAL query method
+                elif (func.attr in SAFE_SET_METHODS
+                      and ast_root_name(func.value) in allowed_names):
+                    pass  # _select on a trusted Set chain
+                else:
+                    raise ValueError("unsafe appadmin expression")
+            else:
+                raise ValueError("unsafe appadmin expression")
+
+
+    # Build restricted namespace containing only the allowed names from the
+    # provided mapping (if any). This ensures we only expose the database
+    # objects that the caller explicitly allowed.
+    namespace = {"__builtins__": None}
+    if allowed_mapping is not None:
+        namespace.update({k: allowed_mapping[k] for k in allowed_names if k in allowed_mapping})
+
+    # Evaluate in the restricted namespace
+    try:
+        return eval(compile(tree, "<appadmin>", "eval"), namespace)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError("Expression evaluation failed: %s" % str(e))

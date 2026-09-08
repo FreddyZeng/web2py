@@ -483,11 +483,6 @@ def executor(retq, task, outq):
 
         def close(self):
             sys.stdout = self.stdout
-            if self.written:
-                # see "Joining processes that use queues" section in
-                # https://docs.python.org/2/library/multiprocessing.html#programming-guidelines
-                # https://docs.python.org/3/library/multiprocessing.html#programming-guidelines
-                self.out_queue.cancel_join_thread()
 
         def flush(self):
             pass
@@ -533,8 +528,10 @@ def executor(retq, task, outq):
             vars = loads(task.vars)
             result = dumps(_function(*args, **vars))
         else:
-            # for testing purpose only
-            result = eval(task.function)(*loads(task.args), **loads(task.vars))
+            raise ValueError(
+                "task.application_name is required; cannot execute task '%s' "
+                "without an app context" % task.function
+            )
         if len(result) >= 1024:
             fd, temp_path = tempfile.mkstemp(suffix=".w2p_sched")
             with os.fdopen(fd, "w") as f:
@@ -751,6 +748,18 @@ class Scheduler(threading.Thread):
             self.terminate_process()
             tr = TaskReport(STOPPED)
         else:
+            # Final drain: collect any output written just before the process exited
+            # that wasn't picked up in the main loop due to timing.
+            while True:
+                try:
+                    tout += outq.get_nowait()
+                except Queue.Empty:
+                    break
+            if tout:
+                if CLEAROUT in tout:
+                    task_output = tout[tout.rfind(CLEAROUT) + len(CLEAROUT):]
+                else:
+                    task_output += tout
             if p.is_alive():
                 logger.debug("    task timeout")
                 self.terminate_process(flush_ret=False)
@@ -1045,17 +1054,31 @@ class Scheduler(threading.Thread):
                         if not self.w_stats.status == DISABLED:
                             self.w_stats.status = ACTIVE
                 else:
+                    # We popped no task, but that doesn't mean we are idle:
+                    # there may be tasks already due (e.g. a failed task
+                    # re-queued for retry with next_run_time = last_run +
+                    # period) that simply haven't been (re)assigned yet. A
+                    # worker with pending due work must not self-terminate via
+                    # max_empty_runs, otherwise retries can be dropped under
+                    # load. Future-scheduled tasks (next_run_time > now) do not
+                    # count, so normal idle shutdown is preserved.
+                    has_due_work = self.has_pending_due_tasks()
                     with self.w_stats_lock:
-                        self.w_stats.empty_runs += 1
-                        if self.max_empty_runs != 0:
-                            logger.debug(
-                                "empty runs %s/%s",
-                                self.w_stats.empty_runs,
-                                self.max_empty_runs,
-                            )
-                            if self.w_stats.empty_runs >= self.max_empty_runs:
-                                logger.info("empty runs limit reached, killing myself")
-                                self.die()
+                        if has_due_work:
+                            self.w_stats.empty_runs = 0
+                        else:
+                            self.w_stats.empty_runs += 1
+                            if self.max_empty_runs != 0:
+                                logger.debug(
+                                    "empty runs %s/%s",
+                                    self.w_stats.empty_runs,
+                                    self.max_empty_runs,
+                                )
+                                if self.w_stats.empty_runs >= self.max_empty_runs:
+                                    logger.info(
+                                        "empty runs limit reached, killing myself"
+                                    )
+                                    self.die()
                     if self.is_a_ticker and self.greedy:
                         # there could be other tasks ready to be assigned
                         logger.info("TICKER: greedy loop")
@@ -1065,6 +1088,35 @@ class Scheduler(threading.Thread):
         except (KeyboardInterrupt, SystemExit):
             logger.info("catched")
             self.die()
+
+    def has_pending_due_tasks(self):
+        """Return True if there are enabled tasks already due to run.
+
+        Used to avoid self-terminating (`max_empty_runs`) while there is work
+        pending but not yet (re)assigned to this worker, e.g. a failed task
+        waiting for its retry. Only tasks that are already due
+        (`next_run_time <= now`) for this worker's groups are considered, so
+        far-future scheduled tasks still allow normal idle shutdown.
+        """
+        db = self.db
+        st = db.scheduler_task
+        now = self.now()
+        try:
+            pending = (
+                db(
+                    (st.status.belongs((QUEUED, ASSIGNED)))
+                    & (st.next_run_time <= now)
+                    & (st.enabled == True)
+                    & (st.group_name.belongs(self.group_names))
+                ).count()
+                > 0
+            )
+            db.commit()
+            return pending
+        except Exception:
+            logger.exception("    error checking for pending due tasks")
+            try_rollback(db)
+            return False
 
     def wrapped_pop_task(self):
         """Commodity function to call `pop_task` and trap exceptions.

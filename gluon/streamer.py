@@ -22,6 +22,7 @@ from gluon.utils import unlocalised_http_header_date
 
 regex_start_range = re.compile(r"\d+(?=\-)")
 regex_stop_range = re.compile(r"(?<=\-)\d+")
+regex_suffix_range = re.compile(r"^bytes=-(\d+)$")
 
 DEFAULT_CHUNK_SIZE = 64 * 1024
 
@@ -84,13 +85,22 @@ def stream_file_or_304_or_206(
             raise HTTP(304, **{"Content-Type": headers["Content-Type"]})
 
         elif request and request.env.http_range:
-            start_items = regex_start_range.findall(request.env.http_range)
-            if not start_items:
-                start_items = [0]
-            stop_items = regex_stop_range.findall(request.env.http_range)
-            if not stop_items or int(stop_items[0]) > fsize - 1:
-                stop_items = [fsize - 1]
-            part = (int(start_items[0]), int(stop_items[0]), fsize)
+            range_header = request.env.http_range
+            suffix_range = regex_suffix_range.match(range_header)
+            if suffix_range:
+                suffix_length = int(suffix_range.group(1))
+                part = (max(fsize - suffix_length, 0), fsize - 1, fsize)
+            else:
+                start_items = regex_start_range.findall(range_header)
+                if not start_items:
+                    start_items = [0]
+                stop_items = regex_stop_range.findall(range_header)
+                if not stop_items or int(stop_items[0]) > fsize - 1:
+                    stop_items = [fsize - 1]
+                part = (int(start_items[0]), int(stop_items[0]), fsize)
+            if part[0] > part[1]:
+                headers["Content-Range"] = "bytes */%i" % fsize
+                raise HTTP(416, **headers)
             bytes = part[1] - part[0] + 1
             try:
                 stream = open(static_file, "rb")
@@ -123,7 +133,11 @@ def stream_file_or_304_or_206(
                 raise HTTP(404)
         headers["Content-Length"] = str(fsize)
         bytes = None
-    if request and request.env.web2py_use_wsgi_file_wrapper:
+    # only hand a bare file object to the wsgi file wrapper for full-content
+    # responses (bytes is None). On a 206 the wrapper streams the seeked file to
+    # EOF, ignoring the range length, so the body would exceed the advertised
+    # Content-Length; fall back to the bounded streamer in that case.
+    if request and request.env.web2py_use_wsgi_file_wrapper and bytes is None:
         wrapped = request.env.wsgi_file_wrapper(stream, chunk_size)
     else:
         wrapped = streamer(stream, chunk_size=chunk_size, bytes=bytes)

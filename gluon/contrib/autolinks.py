@@ -50,6 +50,8 @@ import uuid
 from json import loads
 from urllib.parse import quote as urllib_quote
 
+from gluon.contrib.markmin.markmin2html import is_unsafe
+
 try:
     from BeautifulSoup import BeautifulSoup, Comment
 
@@ -92,20 +94,20 @@ EMBED_MAPS = [
 
 
 def image(url):
-    return '<img src="%s" style="max-width:100%%"/>' % url
+    return '<img src="%s" style="max-width:100%%"/>' % html.escape(url, quote=True)
 
 
 def audio(url):
     return (
         '<audio controls="controls" style="max-width:100%%"><source src="%s" /></audio>'
-        % url
+        % html.escape(url, quote=True)
     )
 
 
 def video(url):
     return (
         '<video controls="controls" style="max-width:100%%"><source src="%s" /></video>'
-        % url
+        % html.escape(url, quote=True)
     )
 
 
@@ -120,7 +122,7 @@ def web2py_component(url):
     code = str(uuid.uuid4())
     return '<div id="%s"></div><script>\nweb2py_component("%s","%s");\n</script>' % (
         code,
-        url,
+        html.escape(url, quote=True),
         code,
     )
 
@@ -178,9 +180,16 @@ def extension(url):
 
 
 def expand_one(url, cdict):
+    # markmin's regex_auto matches any "scheme://..." token, so javascript:,
+    # vbscript: and data: urls reach here when Wiki installs this as the
+    # autolinks callback. Refuse them the way autolinks_simple does, before
+    # any branch below drops the url into an href or src.
+    if is_unsafe(url):
+        return '<span class="markmin_unsafe">%s</span>' % html.escape(url, quote=True)
     # try ombed but first check in cache
     if "@" in url and not "://" in url:
-        return '<a href="mailto:%s">%s</a>' % (url, url)
+        esc = html.escape(url, quote=True)
+        return '<a href="mailto:%s">%s</a>' % (esc, esc)
     if cdict and url in cdict:
         r = cdict[url]
     else:
@@ -201,7 +210,7 @@ def expand_one(url, cdict):
     if ext in EXTENSION_MAPS:
         return EXTENSION_MAPS[ext](url)
     # else regular link
-    return '<a href="%(u)s">%(u)s</a>' % dict(u=url)
+    return '<a href="%(u)s">%(u)s</a>' % dict(u=html.escape(url, quote=True))
 
 
 def expand_html(html, cdict=None):

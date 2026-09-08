@@ -1,4 +1,53 @@
+## 3.1 - 3.3.X
 
+Security hardening since 3.0.x. Two opt-in features are worth calling out:
+
+- Opt-in safe-unpickle sessions: `session.connect(..., safe_unpickle=True)`
+  loads session data through a restricted unpickler instead of raw
+  `pickle.loads()`. Pass `pickle_allowed_classes={module: [names]}` to allow
+  specific classes. Defaults to `False` for backward compatibility; legacy
+  one-colon `secure_loads` payloads now honor the same flag.
+- Opt-in Content-Security-Policy: `response.enable_csp(**directives)` emits a
+  per-request nonce-based CSP header (`default-src 'self'`, nonce'd
+  `script-src`/`style-src`), plus `base-uri 'self'`, `form-action 'self'` and
+  `object-src 'none'`, with directive/token validation. Use `response.nonce`
+  on inline `<script>`/`<style>` tags. `base-uri` and `form-action` do not
+  fall back to `default-src`, so they are set explicitly; pass either as a
+  keyword to override, e.g. `enable_csp(form_action="https://pay.example")`
+  for a site that posts forms off-origin.
+
+Breaking change:
+
+- `Auth.url(scheme=True)` (absolute URLs, used for password-reset and
+  verification emails) no longer derives the host from the client-supplied
+  `Host:` header. You must configure a trusted host via
+  `auth.settings.host` or an allowlist in `auth.settings.host_names`;
+  otherwise an `HTTP 500` is raised.
+
+The bundled `admin` application now uses CSP in report-only mode.
+`enable_csp()` accepts `report_only=True`, which sends
+`Content-Security-Policy-Report-Only` so a browser reports violations without
+blocking them. Other applications must opt in explicitly. Nonces are emitted
+in report-only mode too, so the reports describe what enforcement would do.
+admin's remaining inline `on*=` handlers and `style=` attributes are what stop
+it enforcing today.
+
+Other security fixes in this range:
+
+- Hardened ticket deserialization with the restricted unpickler
+- `safe_load()` used for YAML deserialization in `loads_yaml`
+- Fixed XSS sanitizer attribute-breakout in `XML(..., sanitize=True)`
+- Escaped include file URLs and meta names before HTML attribute rendering
+- Added `SAFEJSON` helper for safe JSON embedding in script contexts
+- Removed `eval` on user-controlled input in appadmin; AST-validated expressions
+- Fixed directory traversal in admin unzip and hardened tar extraction paths
+- Prevented sibling-prefix traversal in static file routing
+- Hardened `Content-Disposition` filenames (attachments and SQLFORM.grid export)
+- Hardened temporary plugin filename handling in `plugin_install()`
+- CAS service allowlist validation
+- Neutralized CSV/formula injection in `Service.serve_csv` exports (and restored
+  its missing `StringIO` import, which had broken every `@service.csv` endpoint)
+- `secrets` module used for secure password generation
 
 ## 2.99 - 3.0.X
 

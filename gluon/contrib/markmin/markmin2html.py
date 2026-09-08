@@ -550,7 +550,8 @@ html_colors = [
 META = "\x06"
 LINK = "\x07"
 DISABLED_META = "\x08"
-LATEX = '<img src="http://chart.apis.google.com/chart?cht=tx&chl=%s" />'
+#LATEX = '<img src="http://chart.apis.google.com/chart?cht=tx&chl=%s" />'
+LATEX = '<img src="https://latex.codecogs.com/png.latex?%s" />' 
 regex_URL = re.compile(
     r"@/(?P<a>\w*)/(?P<c>\w*)/(?P<f>\w*(\.\w+)?)(/(?P<args>[\w\.\-/]+))?"
 )
@@ -714,8 +715,20 @@ def replace_components(text, env):
     text = regex_env2.sub(u2, text)
     return text
 
+
+_UNSAFE_URL_SCHEMES = {"data", "javascript", "vbscript"}
+
+
 def is_unsafe(url):
-    return (url or "").lower().replace(" ", "").startswith("javascript:")
+    # Browsers strip ASCII C0 controls and spaces while processing URLs.
+    # Remove them before checking the scheme so values like java\0script:
+    # cannot bypass the dangerous-scheme check.
+    url_cleaned = "".join(
+        c for c in (url or "") if ord(c) > 0x20 and ord(c) != 0x7F
+    ).lower()
+    scheme, has_scheme, _ = url_cleaned.partition(":")
+    return has_scheme and scheme in _UNSAFE_URL_SCHEMES
+
 
 def autolinks_simple(url):
     """
@@ -1407,11 +1420,14 @@ def render(
         t, a, k, p, w = m.group("t", "a", "k", "p", "w")
         if not k:
             return m.group(0)
-        k = local_html_escape(k)
+        # quote=True: k is emitted inside src="..."/href="..."; without escaping
+        # the double quote an attacker URL like http://x"onerror="alert(1) would
+        # break out of the attribute and inject an event handler (XSS).
+        k = local_html_escape(k, quote=True)
         t = t or ""
         style = "width:%s" % w if w else ""
         title = (
-            ' title="%s"' % local_html_escape(a).replace(META, DISABLED_META)
+            ' title="%s"' % local_html_escape(a, quote=True).replace(META, DISABLED_META)
             if a
             else ""
         )
@@ -1427,8 +1443,14 @@ def render(
             p_end = "</p>" + pp
         elif p in ("left", "right"):
             style = ("float:%s" % p) + (";%s" % style if style else "")
-        if t and regex_auto.match(t):
-            p_begin = p_begin + '<a href="%s">' % t
+        if t and regex_auto.match(t) and not is_unsafe(t):
+            # t is an auto-url reused as the wrapping link target. regex_auto
+            # is matched with re.match (not anchored at the end), so a value
+            # like http://x" onmouseover="alert(1) still satisfies the guard;
+            # escape it (quote=True) so it cannot break out of href="..." and
+            # inject an event handler (XSS), and reject javascript: targets the
+            # same way sub_link does.
+            p_begin = p_begin + '<a href="%s">' % local_html_escape(t, quote=True)
             p_end = "</a>" + p_end
             t = ""
         if style:
@@ -1453,7 +1475,9 @@ def render(
                 % dict(p=p, title=title, style=style, k=k, t=t)
             )
         alt = (
-            ' alt="%s"' % local_html_escape(t).replace(META, DISABLED_META) if t else ""
+            ' alt="%s"' % local_html_escape(t, quote=True).replace(META, DISABLED_META)
+            if t
+            else ""
         )
         return '%(begin)s<img src="%(k)s"%(alt)s%(title)s%(style)s />%(end)s' % dict(
             begin=p_begin, k=k, alt=alt, title=title, style=style, end=p_end
@@ -1466,12 +1490,15 @@ def render(
         if is_unsafe(k):
             return f'<span class="markmin_unsafe">{html_module.escape(t)}</span>'
         t = t or ""
-        a = local_html_escape(a) if a else ""
+        # quote=True: a is emitted inside title="..." and k inside href="...".
+        # Escaping the double quote prevents attribute breakout / event-handler
+        # injection (XSS) from attacker-controlled link targets and titles.
+        a = local_html_escape(a, quote=True) if a else ""
         if k:
             if "#" in k and ":" not in k.split("#")[0]:
                 # wikipage, not external url
                 k = k.replace("#", "#" + id_prefix)
-            k = local_html_escape(k)
+            k = local_html_escape(k, quote=True)
             title = ' title="%s"' % a.replace(META, DISABLED_META) if a else ""
             target = ' target="_blank"' if p == "popup" else ""
             t = (
@@ -1498,7 +1525,7 @@ def render(
         if t == "NEWLINE" and not a:
             return "<br />" + pp
         return '<span class="anchor" id="%s">%s</span>' % (
-            local_html_escape(id_prefix + t),
+            local_html_escape(id_prefix + t, quote=True),
             render(
                 a,
                 {},
@@ -1550,7 +1577,7 @@ def render(
                 "["
                 + ",".join(
                     '<a href="#%s" class="%s">%s</a>' % (id_prefix + d, b, d)
-                    for d in local_html_escape(code).split(",")
+                    for d in local_html_escape(code, quote=True).split(",")
                 )
                 + "]"
             )
@@ -1575,7 +1602,7 @@ def render(
                 ),
             )
         elif b in ("c", "color") and p:
-            c = p.split(":")
+            c = local_html_escape(p, quote=True).split(":")
             fg = "color: %s;" % c[0] if c[0] else ""
             bg = "background-color: %s;" % c[1] if len(c) > 1 and c[1] else ""
             return '<span style="%s%s">%s</span>' % (
@@ -1597,7 +1624,7 @@ def render(
                 ),
             )
         cls = ' class="%s%s"' % (class_prefix, b) if b and b != "id" else ""
-        id = ' id="%s%s"' % (id_prefix, local_html_escape(p)) if p else ""
+        id = ' id="%s%s"' % (id_prefix, local_html_escape(p, quote=True)) if p else ""
         beg = code[:1] == "\n"
         end = [None, -1][code[-1:] == "\n"]
         if beg and end:

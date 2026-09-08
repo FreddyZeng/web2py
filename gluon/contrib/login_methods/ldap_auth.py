@@ -8,6 +8,7 @@ import sys
 
 try:
     import ldap
+    import ldap.dn
     import ldap.filter
 
     ldap.set_option(ldap.OPT_REFERRALS, 0)
@@ -210,7 +211,18 @@ def ldap_auth(
         group_mapping=group_mapping,
         db=db,
     ):
-        if password == "":  # http://tools.ietf.org/html/rfc4513#section-5.1.2
+        if ldap_mode not in (
+            "ad",
+            "domino",
+            "cn",
+            "uid",
+            "company",
+            "uid_r",
+            "custom",
+        ):
+            logger.error("unsupported LDAP authentication mode: %s", ldap_mode)
+            return False
+        if not password:  # http://tools.ietf.org/html/rfc4513#section-5.1.2
             logger.warning("blank password not allowed")
             return False
         logger.debug(
@@ -307,7 +319,7 @@ def ldap_auth(
                 # OpenLDAP (CN)
                 if ldap_binddn and ldap_bindpw:
                     con.simple_bind_s(ldap_binddn, ldap_bindpw)
-                dn = "cn=" + username + "," + ldap_basedn
+                dn = "cn=" + ldap.dn.escape_dn_chars(username) + "," + ldap_basedn
                 con.simple_bind_s(dn, password)
                 if manage_user:
                     result = con.search_s(
@@ -321,12 +333,15 @@ def ldap_auth(
                 # OpenLDAP (UID)
                 if ldap_binddn and ldap_bindpw:
                     con.simple_bind_s(ldap_binddn, ldap_bindpw)
-                    dn = "uid=" + username + "," + ldap_basedn
+                    dn = "uid=" + ldap.dn.escape_dn_chars(username) + "," + ldap_basedn
                     dn = con.search_s(
-                        ldap_basedn, ldap.SCOPE_SUBTREE, "(uid=%s)" % username, [""]
+                        ldap_basedn,
+                        ldap.SCOPE_SUBTREE,
+                        "(uid=%s)" % ldap.filter.escape_filter_chars(username),
+                        [""],
                     )[0][0]
                 else:
-                    dn = "uid=" + username + "," + ldap_basedn
+                    dn = "uid=" + ldap.dn.escape_dn_chars(username) + "," + ldap_basedn
                 con.simple_bind_s(dn, password)
                 if manage_user:
                     result = con.search_s(

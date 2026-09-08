@@ -15,7 +15,6 @@ import copy
 import copyreg
 import functools
 import itertools
-import marshal
 import os
 import pickle
 import re
@@ -27,7 +26,6 @@ from urllib.parse import quote as urllib_quote
 from urllib.parse import urlencode
 
 from yatl import sanitizer
-
 from gluon import decoder
 from gluon.highlight import highlight
 from gluon.storage import Storage
@@ -126,6 +124,7 @@ __all__ = [
     "URL",
     "XHTML",
     "XML",
+    "SAFEJSON",
     "xmlescape",
     "embed64",
 ]
@@ -152,6 +151,18 @@ def xmlescape(data, quote=True):
     # ... and do the escaping
     data = local_html_escape(data, quote)
     return data
+
+
+def SAFEJSON(obj):
+    """
+    Safely JSON-encode `obj` for embedding into JavaScript contexts.
+
+    Uses serializers.json which employs JSONEncoderForHTML to escape
+    HTML-unsafe characters like &, <, >, and invalid JS line terminators.
+    """
+    from gluon.serializers import json as serializers_json
+
+    return SafeString(serializers_json(obj))
 
 
 def call_as_list(f, *a, **b):
@@ -741,11 +752,11 @@ class XML(XmlComponent):
 
 
 def XML_unpickle(data):
-    return XML(marshal.loads(data))
+    return XML(data)
 
 
 def XML_pickle(data):
-    return XML_unpickle, (marshal.dumps(str(data)),)
+    return XML_unpickle, (str(data),)
 
 
 copyreg.pickle(XML, XML_pickle, XML_unpickle)
@@ -1505,6 +1516,15 @@ class SCRIPT(DIV):
     tag = "script"
     tagname = tag
 
+    def _xml(self):
+        fa, co = DIV._xml(self)
+        if not self.attributes.get("_nonce"):
+            from gluon.globals import current
+            response = getattr(current, "response", None)
+            if response and response._csp_enabled:
+                fa += ' nonce="%s"' % response.nonce
+        return fa, co
+
     def xml(self):
         (fa, co) = self._xml()
         # no escaping of subcomponents
@@ -1528,6 +1548,15 @@ class SCRIPT(DIV):
 class STYLE(DIV):
     tag = "style"
     tagname = tag
+
+    def _xml(self):
+        fa, co = DIV._xml(self)
+        if not self.attributes.get("_nonce"):
+            from gluon.globals import current
+            response = getattr(current, "response", None)
+            if response and response._csp_enabled:
+                fa += ' nonce="%s"' % response.nonce
+        return fa, co
 
     def xml(self):
         (fa, co) = self._xml()
@@ -2166,7 +2195,7 @@ class FORM(DIV):
             keyname = "_formkey[%s]" % formname
             formkeys = list(session.get(keyname, []))
             # check if user tampering with form and void CSRF
-            if not (formkey and formkeys and formkey in formkeys):
+            if not (formkey and formkeys and any(compare(formkey, k) for k in formkeys)):
                 status = False
             else:
                 session[keyname].remove(formkey)
@@ -2376,7 +2405,16 @@ class FORM(DIV):
         self.validate(**kwargs)
         return self
 
-    REDIRECT_JS = "window.location='%s';return false"
+    REDIRECT_JS = "window.location=%s;return false"
+
+    @staticmethod
+    def _redirect_js(url):
+        if url.startswith("javascript:"):
+            return url
+
+        from gluon.serializers import json
+
+        return FORM.REDIRECT_JS % json(url)
 
     def add_button(self, value, url, _class=None):
         submit = self.element(_type="submit")
@@ -2385,9 +2423,7 @@ class FORM(DIV):
             TAG["button"](
                 value,
                 _class=_class,
-                _onclick=(
-                    url if url.startswith("javascript:") else self.REDIRECT_JS % url
-                ),
+                _onclick=self._redirect_js(url),
             )
         )
 
@@ -2398,7 +2434,7 @@ class FORM(DIV):
         if not hidden:
             hidden = {}
         inputs = [
-            INPUT(_type="button", _value=name, _onclick=FORM.REDIRECT_JS % link)
+            INPUT(_type="button", _value=name, _onclick=FORM._redirect_js(link))
             for name, link in buttons.items()
         ]
         inputs += [
@@ -2951,11 +2987,11 @@ def ASSIGNJS(**kargs):
         Javascript vars assignations for the key/value passed.
 
     """
-    from gluon.serializers import json
+    from gluon.serializers import json as serializers_json
 
     s = ""
     for key, value in kargs.items():
-        s += "var %s = %s;\n" % (key, json(value))
+        s += "var %s = %s;\n" % (key, serializers_json(value))
     return XML(s)
 
 

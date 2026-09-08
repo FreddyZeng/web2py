@@ -25,10 +25,13 @@ import os
 import pickle
 import random
 import re
+import secrets
 import smtplib
+import ssl
 import sys
 import time
 import traceback
+from io import StringIO
 from email import encoders as Encoders
 from email import message_from_string
 from email.charset import QP as charset_QP
@@ -60,7 +63,7 @@ from gluon.contrib.markmin.markmin2html import (
 )
 from gluon.fileutils import check_credentials, read_file
 from gluon.storage import Messages, Settings, Storage, StorageList
-from gluon.utils import compare, web2py_uuid
+from gluon.utils import compare, csv_safe, csv_safe_text, web2py_uuid
 
 Table = DAL.Table
 Field = DAL.Field
@@ -182,6 +185,11 @@ def prevent_open_redirect(url, host=None):
     return original
 
 
+# ``csv_safe`` and ``csv_safe_text`` are defined in gluon.utils (security
+# utilities, reused by gluon.sqlhtml's grid exporters) and re-exported here for
+# backward compatibility.
+
+
 class Mail(object):
     """
     Class for configuring and sending emails with alternative text / html
@@ -248,6 +256,10 @@ class Mail(object):
                               the messages with can be a file name /
                               string or a list of file names /
                               strings (PEM format)
+        self_signed_certificate: skip verification of the mail server
+                              certificate, for a relay that presents a
+                              self-signed one. Same opt-in as ldap_auth
+                              and freeipa_auth. Defaults to False
 
     Examples:
         Create Mail object with authentication data for remote server::
@@ -347,6 +359,9 @@ class Mail(object):
         settings.x509_nocerts = False
         settings.x509_crypt_certfiles = None
         settings.debug = False
+        # Skip verification of the mail server certificate, for a relay that
+        # presents a self-signed one. Same opt-in as ldap_auth and freeipa_auth.
+        settings.self_signed_certificate = False
         settings.lock_keys = True
         self.result = {}
         self.error = None
@@ -497,6 +512,12 @@ class Mail(object):
                 text = encode_header(text)
             return text
 
+        def read_body(x):
+            if isinstance(x, str):
+                return x
+            result = x.read()
+            return result.decode("utf8") if isinstance(result, bytes) else result
+
         sender = sender or self.settings.sender
 
         if not isinstance(self.settings.server, str):
@@ -509,9 +530,7 @@ class Mail(object):
             payload_in = MIMEMultipart("mixed")
         elif raw:
             # no encoding configuration for raw messages
-            if not isinstance(message, str):
-                message = message.read().decode("utf8")
-            text = message
+            text = read_body(message)
             # No charset passed to avoid transport encoding
             # NOTE: some unicode encoded strings will produce
             # unreadable mail contents.
@@ -545,11 +564,9 @@ class Mail(object):
 
         if (text is not None or html is not None) and (not raw):
             if text is not None:
-                if not isinstance(text, str):
-                    text = text.read().decode("utf8")
+                text = read_body(text)
             if html is not None:
-                if not isinstance(html, str):
-                    html = html.read().decode("utf8")
+                html = read_body(html)
 
             # Construct mime part only if needed
             if text is not None and html:
@@ -927,13 +944,25 @@ class Mail(object):
             else:
                 smtp_args = self.settings.server.split(":")
                 kwargs = dict(timeout=self.settings.timeout)
+                # Without a context, smtplib falls back to
+                # ssl._create_stdlib_context(), which sets check_hostname=False
+                # and verify_mode=CERT_NONE. Both the implicit TLS branch below
+                # and starttls() were unverified, so the login credentials and
+                # the message went to whatever certificate the peer presented.
+                context = (
+                    None
+                    if self.settings.self_signed_certificate
+                    else ssl.create_default_context()
+                )
                 func = smtplib.SMTP_SSL if self.settings.ssl else smtplib.SMTP
+                if self.settings.ssl:
+                    kwargs["context"] = context
                 server = remote_server or func(*smtp_args, **kwargs)
                 try:
                     if not remote_server:
                         if self.settings.tls and not self.settings.ssl:
                             server.ehlo(self.settings.hostname)
-                            server.starttls()
+                            server.starttls(context=context)
                             server.ehlo(self.settings.hostname)
                         if self.settings.login:
                             server.login(*self.settings.login.split(":", 1))
@@ -1597,6 +1626,7 @@ class Auth(AuthAPI):
         auth_two_factor_tries_left=3,
         bulk_register_enabled=False,
         captcha=None,
+        cas_allowed_services=None,
         cas_maps=None,
         client_side=True,
         formstyle=None,
@@ -1812,6 +1842,29 @@ class Auth(AuthAPI):
         if vars is None:
             vars = {}
         host = scheme and self.settings.host
+        if scheme and not host:
+            # Absolute URL requested but no host was pinned in
+            # settings.host. Falling through to URL() would derive the
+            # host from request.env.http_host, which is taken verbatim
+            # from the client-supplied Host: header. This is the classic
+            # password-reset token-leak primitive (CWE-640): an attacker
+            # submits the reset form with `Host: attacker.com` and the
+            # victim is emailed `http://attacker.com/.../reset_password
+            # ?key=<TOKEN>`; the token leaks on click. Require an
+            # explicit allowlist instead.
+            host_names = self.settings.host_names
+            if host_names:
+                host = self.select_host(
+                    current.request.env.http_host, host_names
+                )
+            else:
+                raise HTTP(
+                    500,
+                    "Auth.url(scheme=True) requires auth.settings.host or "
+                    "host_names to be configured; refusing to derive the "
+                    "host from the request Host header.",
+                    web2py_error="absolute Auth URL without trusted host",
+                )
         return URL(
             c=self.settings.controller,
             f=f,
@@ -1958,7 +2011,12 @@ class Auth(AuthAPI):
             label_separator=current.response.form_label_separator,
             two_factor_methods=[],
             two_factor_onvalidation=[],
-            host=host,
+            # Only pin settings.host when the app supplied an allowlist
+            # (host_names); otherwise leave it unset so that Auth.url()
+            # refuses to mint absolute URLs from an unverified request
+            # Host header. See Auth.url() for the rationale.
+            host=host if host_names else None,
+            host_names=host_names,
         )
         settings.lock_keys = True
         # ## these are messages that can be customized
@@ -2079,7 +2137,12 @@ class Auth(AuthAPI):
             ):
                 return self.cas_validate(version=3, proxy=True)
             elif args(1) == self.settings.cas_actions["logout"]:
-                return self.logout(next=request.vars.service or DEFAULT)
+                incoming_service = request.vars.service
+                if incoming_service is not None and not self._is_allowed_cas_service(
+                    incoming_service
+                ):
+                    raise HTTP(403, "service not allowed")
+                return self.logout(next=incoming_service or DEFAULT)
         else:
             raise HTTP(404)
 
@@ -2704,6 +2767,58 @@ class Auth(AuthAPI):
             return False
         return user
 
+    def _is_allowed_cas_service(self, url):
+        # The CAS provider redirects an authenticated user to `service` with a
+        # freshly-minted ticket appended. Without validation, an attacker
+        # phishes the victim to /user/cas/login?service=https://attacker/ and
+        # receives a valid ticket they can replay against any relying party
+        # that trusts this provider (CWE-601 + credential leak). The CAS
+        # protocol therefore requires the provider to enforce a service-URL
+        # allowlist; `cas_allowed_services` is that allowlist.
+        #
+        # Accepted values:
+        #   None        - deny all external services (default; only allow
+        #                 services whose host matches `cas_domains`)
+        #   list/tuple  - of allowed URL strings. An entry ending in "/"
+        #                 matches by prefix; otherwise the URL or its origin
+        #                 ("scheme://host[:port]") must match exactly. The
+        #                 trailing-slash rule prevents prefix-confusion
+        #                 (`https://good.example` matching
+        #                 `https://good.example.attacker.com/...`).
+        #   callable    - `f(url) -> bool`
+        #
+        # Only https:// service URLs are accepted. http:// would expose the
+        # CAS ticket in plaintext in transit and in proxy/server access logs.
+        if not url or not isinstance(url, str):
+            return False
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in url):
+            return False
+        try:
+            parsed = urlparse.urlparse(url)
+        except ValueError:
+            return False
+        if parsed.scheme != "https" or not parsed.netloc:
+            return False
+        allowed = self.settings.cas_allowed_services
+        if allowed is None:
+            return parsed.netloc in (self.settings.cas_domains or [])
+        if callable(allowed):
+            try:
+                return bool(allowed(url))
+            except Exception:
+                return False
+        if not isinstance(allowed, (list, tuple)):
+            return False
+        origin = "%s://%s" % (parsed.scheme, parsed.netloc)
+        for entry in allowed:
+            if not isinstance(entry, str):
+                continue
+            if url == entry or origin == entry.rstrip("/"):
+                return True
+            if entry.endswith("/") and url.startswith(entry):
+                return True
+        return False
+
     def cas_login(
         self,
         next=DEFAULT,
@@ -2716,10 +2831,16 @@ class Auth(AuthAPI):
         response = current.response
         session = current.session
         db, table = self.db, self.table_cas()
-        session._cas_service = request.vars.service or session._cas_service
+        incoming_service = request.vars.service
+        if incoming_service is not None and not self._is_allowed_cas_service(
+            incoming_service
+        ):
+            raise HTTP(403, "service not allowed")
+        session._cas_service = incoming_service or session._cas_service
         if (
             request.env.http_host not in self.settings.cas_domains
             or not session._cas_service
+            or not self._is_allowed_cas_service(session._cas_service)
         ):
             raise HTTP(403, "not authorized")
 
@@ -2770,6 +2891,12 @@ class Auth(AuthAPI):
         renew = "renew" in request.vars
         row = table(ticket=ticket)
         success = False
+        if row and not self._is_allowed_cas_service(row.service):
+            # Refuse to validate a ticket whose stored service URL is no
+            # longer in the allowlist (e.g. allowlist tightened after the
+            # ticket was minted, or ticket forged in an older version).
+            row.delete_record()
+            row = None
         if row:
             userfield = (
                 self.settings.login_userfield or "username"
@@ -3146,7 +3273,7 @@ class Auth(AuthAPI):
                 session.auth_two_factor_user = (
                     user  # store the validated user and associate with this session
                 )
-                session.auth_two_factor = random.randint(100000, 999999)
+                session.auth_two_factor = secrets.randbelow(900000) + 100000
                 session.auth_two_factor_tries_left = (
                     self.settings.auth_two_factor_tries_left
                 )
@@ -3236,7 +3363,15 @@ class Auth(AuthAPI):
                         else:
                             break
 
-                if form.vars["authentication_code"] == str(session.auth_two_factor):
+                # A None expected code means no code was ever issued for this
+                # session, or a two_factor_methods/two_factor_onvalidation
+                # callback signalled failure by returning None. str(None) is
+                # the guessable literal "None", so never accept a submitted
+                # code against it.
+                expected_code = session.auth_two_factor
+                if expected_code is not None and form.vars[
+                    "authentication_code"
+                ] == str(expected_code):
                     # Handle the case when the two-factor form has been successfully validated
                     # and the user was previously stored (the current user should be None because
                     # in this case, the previous username/password login form should not be displayed.
@@ -3551,6 +3686,15 @@ class Auth(AuthAPI):
 
         key = getarg(-1)
         table_user = self.table_user()
+        # registration_key also holds the reserved states "", "pending",
+        # "disabled" and "blocked". Only the random token issued at
+        # registration is a genuine verification key, so refuse these
+        # values here; otherwise a request for verify_email/disabled (or
+        # /blocked, /pending) would match such an account and clear its key,
+        # re-activating an account an administrator disabled or one still
+        # awaiting approval.
+        if not key or key in ("pending", "disabled", "blocked"):
+            redirect(self.settings.login_url)
         user = table_user(registration_key=key)
         if not user:
             redirect(self.settings.login_url)
@@ -3663,17 +3807,17 @@ class Auth(AuthAPI):
         return form
 
     def random_password(self):
-        import random
         import string
 
-        password = ""
         specials = r"!#$*"
+        chars = []
         for i in range(0, 3):
-            password += random.choice(string.ascii_lowercase)
-            password += random.choice(string.ascii_uppercase)
-            password += random.choice(string.digits)
-            password += random.choice(specials)
-        return "".join(random.sample(password, len(password)))
+            chars.append(secrets.choice(string.ascii_lowercase))
+            chars.append(secrets.choice(string.ascii_uppercase))
+            chars.append(secrets.choice(string.digits))
+            chars.append(secrets.choice(specials))
+        secrets.SystemRandom().shuffle(chars)
+        return "".join(chars)
 
     def reset_password_deprecated(
         self,
@@ -3933,7 +4077,9 @@ class Auth(AuthAPI):
         table_token.token.writable = False
         if current.request.args(1) == "new":
             table_token.token.readable = False
-        form = SQLFORM.grid(table_token, args=["manage_tokens"])
+        form = SQLFORM.grid(
+            table_token.user_id == self.user.id, args=["manage_tokens"]
+        )
         return form
 
     def reset_password(
@@ -4553,21 +4699,26 @@ class Auth(AuthAPI):
             table_user = self.table_user()
             from gluon.settings import global_settings
 
-            if global_settings.web2py_runtime_gae:
-                row = table_token(token=token)
-                if row:
-                    user = table_user(row.user_id)
-            else:
-                row = (
-                    self.db(table_token.token == token)(
-                        table_user.id == table_token.user_id
+            if token:
+                now = request.now
+                if global_settings.web2py_runtime_gae:
+                    row = table_token(token=token)
+                    if row and row.expires_on and row.expires_on > now:
+                        user = table_user(row.user_id)
+                else:
+                    row = (
+                        self.db(table_token.token == token)(
+                            table_token.expires_on > now
+                        )(table_user.id == table_token.user_id)
+                        .select()
+                        .first()
                     )
-                    .select()
-                    .first()
-                )
-                if row:
-                    user = row[table_user._tablename]
-            if user:
+                    if row:
+                        user = row[table_user._tablename]
+            # a token is only as good as the account behind it: honor the
+            # same registration_key states that login_bare() refuses, so
+            # blocking or disabling a user also revokes its tokens
+            if user and not (user.registration_key or "").strip():
                 self.login_user(user)
         return self.requires(True, otherwise=otherwise)
 
@@ -5776,7 +5927,11 @@ class Service(object):
             )
             s = StringIO()
             if hasattr(r, "export_to_csv_file"):
+                # DAL Rows are written by pydal's csv writer, which we cannot
+                # neutralize cell-by-cell; sanitize the serialized text instead
+                # so this path is protected like the dict/list branches below.
                 r.export_to_csv_file(s)
+                return csv_safe_text(s.getvalue())
             elif (
                 r
                 and not isinstance(r, types.GeneratorType)
@@ -5785,15 +5940,17 @@ class Service(object):
                 import csv
 
                 writer = csv.writer(s)
-                writer.writerow(list(r[0].keys()))
+                writer.writerow([csv_safe(k) for k in r[0].keys()])
                 for line in r:
-                    writer.writerow([none_exception(v) for v in line.values()])
+                    writer.writerow(
+                        [csv_safe(none_exception(v)) for v in line.values()]
+                    )
             else:
                 import csv
 
                 writer = csv.writer(s)
                 for line in r:
-                    writer.writerow(line)
+                    writer.writerow([csv_safe(v) for v in line])
             return s.getvalue()
         self.error()
 
@@ -5982,7 +6139,7 @@ class Service(object):
                 return ""
             else:
                 return "[" + ",".join(retlist) + "]"
-        methods = self.jsonrpc2_procedures
+        methods = dict(self.jsonrpc2_procedures)
         methods.update(self.jsonrpc_procedures)
 
         try:
@@ -6469,6 +6626,12 @@ class Expose(object):
         if not self.in_base(filename):
             raise HTTP(401, "NOT AUTHORIZED")
         if allow_download and not os.path.isdir(filename):
+            # Files hidden from the directory listing by isprivate() (dotfiles,
+            # "private" components, editor backups) must not be retrievable by
+            # requesting them directly either, otherwise the filtering only
+            # provides a false sense of protection.
+            if self.isprivate(filename):
+                raise HTTP(404, "FILE NOT FOUND")
             current.response.headers["Content-Type"] = contenttype(filename)
             raise HTTP(200, open(filename, "rb"), **current.response.headers)
         self.path = path = os.path.join(filename, "*")
@@ -6540,12 +6703,26 @@ class Expose(object):
         """True if f is a symlink and is pointing outside of self.base"""
         return os.path.islink(f) and not self.in_base(f)
 
-    @staticmethod
-    def isprivate(f):
-        # remove '/private' prefix to deal with symbolic links on OSX
-        if f.startswith("/private/"):
-            f = f[8:]
-        return "private" in f or f.startswith(".") or f.endswith("~")
+    def isprivate(self, f):
+        # A file/folder is considered private when any of its path components
+        # *below base* is a dotfile, an editor backup ("~"), or named
+        # "private". Only the portion under base is examined: the previous
+        # implementation tested the absolute path, which meant
+        #   - f.startswith(".") was dead code (an absolute path never starts
+        #     with "."), so dotfiles such as ".git" or ".env" were exposed; and
+        #   - "private" in f / the macOS "/private" prefix could match a
+        #     component of the base directory and hide everything.
+        try:
+            rel = os.path.relpath(f, self.base)
+        except ValueError:
+            # e.g. different drive on Windows: not under base, treat as private
+            return True
+        parts = rel.replace("\\", "/").split("/")
+        return any(
+            part == "private" or part.startswith(".") or part.endswith("~")
+            for part in parts
+            if part not in ("", ".", "..")
+        )
 
     @staticmethod
     def isimage(f):
@@ -6943,7 +7120,7 @@ class Wiki(object):
             return self.preview(self.get_renderer())
 
     def first_paragraph(self, page):
-        if not self.can_read(page):
+        if self.can_read(page):
             mm = (page.body or "").replace("\r", "")
             ps = [p for p in mm.split("\n\n") if not p.startswith("#") and p.strip()]
             if ps:
@@ -6952,6 +7129,24 @@ class Wiki(object):
 
     def fix_hostname(self, body):
         return (body or "").replace("://HOSTNAME", "://%s" % self.host)
+
+    def _template_body(self, from_template, title_guess):
+        # Body used to pre-fill the editor when creating a new page. A template
+        # id is only honoured when the requester is allowed to read that page,
+        # otherwise the edit form would hand back the body of an arbitrary
+        # (possibly access-restricted) page. create() constrains from_template
+        # to settings.templates, but _edit is reachable with a raw id in args.
+        default = "## %s\n\npage content" % title_guess
+        try:
+            template_id = int(from_template)
+        except (TypeError, ValueError):
+            return default
+        if template_id <= 0:
+            return default
+        template_page = self.auth.db.wiki_page(id=template_id)
+        if template_page and self.can_read(template_page):
+            return template_page.body
+        return default
 
     def read(self, slug, force_render=False):
         if slug in "_cloud":
@@ -7017,12 +7212,8 @@ class Wiki(object):
                     "- Menu Item > @////index\n- - Submenu > http://web2py.com"
                 )
             else:
-                db.wiki_page.body.default = (
-                    db(db.wiki_page.id == from_template)
-                    .select(db.wiki_page.body)[0]
-                    .body
-                    if int(from_template) > 0
-                    else "## %s\n\npage content" % title_guess
+                db.wiki_page.body.default = self._template_body(
+                    from_template, title_guess
                 )
         vars = current.request.post_vars
         if vars.body:
@@ -7416,7 +7607,11 @@ class Wiki(object):
                 content.append(DIV(_class="w2p_wiki_pages", *items))
             else:
                 cloud = False
-                content = [p.wiki_page.as_dict() for p in pages]
+                content = [
+                    p.wiki_page.as_dict()
+                    for p in pages
+                    if self.can_read(p.wiki_page)
+                ]
         elif cloud:
             content.append(self.cloud()["content"])
         if request.extension == "load":
@@ -7455,6 +7650,11 @@ class Wiki(object):
         return dict(content=DIV(_class="w2p_cloud", *items))
 
     def preview(self, render):
+        # previewing renders whatever is posted (body, tags and, with more than
+        # one engine configured, the engine itself), so it needs the same
+        # authoring permission as the edit and create forms it belongs to
+        if not self.can_edit():
+            return self.not_authorized()
         request = current.request
         # FIXME: This is an ugly hack to ensure a default render
         # engine if not specified (with multiple render engines)

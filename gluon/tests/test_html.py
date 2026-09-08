@@ -5,8 +5,10 @@
     Unit tests for gluon.html
 """
 
+import io
 import re
 import unittest
+from html.parser import HTMLParser
 
 from gluon.decoder import decoder
 from gluon.html import (ASSIGNJS, BEAUTIFY, BODY, BR, BUTTON, CAT, CENTER,
@@ -16,10 +18,11 @@ from gluon.html import (ASSIGNJS, BEAUTIFY, BODY, BR, BUTTON, CAT, CENTER,
                         OBJECT, OL, OPTGROUP, OPTION, PRE, SCRIPT, SELECT,
                         SPAN, STRONG, STYLE, TABLE, TAG, TBODY, TD, TEXTAREA,
                         TFOOT, TH, THEAD, TITLE, TR, TT, UL, URL, XHTML, XML,
-                        A, B, I, P, TAG_pickler, TAG_unpickler, XML_pickle,
+                        A, B, I, P, SAFEJSON, SafeString, TAG_pickler, TAG_unpickler, XML_pickle,
                         XML_unpickle, truncate_string, verifyURL,
                         web2pyHTMLParser, xmlescape)
 from gluon.storage import Storage
+from gluon.globals import current, Request, Response
 
 
 class TestBareHelpers(unittest.TestCase):
@@ -308,6 +311,36 @@ class TestBareHelpers(unittest.TestCase):
             XML("<p>Test</p><br/><p>Test</p><br/>", sanitize=True).xml(),
             XML("<p>Test</p><br/><p>Test</p><br/>").xml(),
         )
+        # sanitizer must not allow attribute-breakout XSS via
+        # entity-encoded quotes inside href/src/background. HTMLParser
+        # decodes &quot; into " in attribute values; the sanitizer must
+        # re-escape (or otherwise contain) those quotes when emitting
+        # the attribute, otherwise an attacker can inject extra
+        # attributes such as event handlers.
+        for raw in (
+            '<a href="https://example.com/&quot; onclick=&quot;alert(1)">x</a>',
+            '<a href="http://a.b/&quot; onmouseover=&quot;alert(1)">x</a>',
+            '<img src="http://a.b/&quot; onerror=&quot;alert(1)" alt="x">',
+            "<a href='http://a.b/&quot; onclick=&quot;alert(1)'>x</a>",
+        ):
+            cleaned = XML(raw, sanitize=True).xml()
+            seen_attrs = []
+
+            class _Spy(HTMLParser):
+                def handle_starttag(self, tag, attrs):
+                    seen_attrs.extend(name.lower() for name, _ in attrs)
+
+                handle_startendtag = handle_starttag
+
+            spy = _Spy()
+            spy.feed(cleaned)
+            for handler in (
+                "onclick", "onerror", "onmouseover", "onload",
+                "onfocus", "onmouseout",
+            ):
+                self.assertNotIn(handler, seen_attrs,
+                    "sanitize() leaked %s via attribute-breakout: %r"
+                    % (handler, cleaned))
         # basic flatten test
         self.assertEqual(XML("<p>Test</p>").flatten(), "<p>Test</p>")
         self.assertEqual(
@@ -320,6 +353,17 @@ class TestBareHelpers(unittest.TestCase):
             str(XML_unpickle(XML_pickle("data to be pickle")[1][0])),
             "data to be pickle",
         )
+
+    def test_XML_pickle_stores_plain_text_not_marshal(self):
+        # XML must pickle its text directly. Marshalling it routed the pickled
+        # bytes into marshal.loads inside XML_unpickle, which
+        # gluon.restricted.TicketStorage whitelists in its SafeUnpickler
+        # allow-list, exposing crafted ticket data to an unsafe deserializer.
+        reducer, args = XML_pickle(XML("<b>hi</b>"))
+        self.assertIs(reducer, XML_unpickle)
+        self.assertIsInstance(args[0], str)
+        self.assertEqual(args, ("<b>hi</b>",))
+        self.assertEqual(str(XML_unpickle(args[0])), "<b>hi</b>")
 
     def test_DIV(self):
         # Empty DIV()
@@ -398,6 +442,93 @@ class TestBareHelpers(unittest.TestCase):
         self.assertEqual(CAT().xml(), "")
         # CAT('')
         self.assertEqual(CAT("").xml(), "")
+
+    def test_csp_nonce_injection(self):
+        # setup request/response
+        current.request = Request(env={})
+        current.request.application = "a"
+        current.response = Response()
+
+        # no nonce when CSP not enabled
+        s = SCRIPT('alert(1)')
+        self.assertNotIn('nonce="', s.xml())
+        st = STYLE('body { color: red }')
+        self.assertNotIn('nonce="', st.xml())
+
+        # include_files without CSP shouldn't add nonce
+        current.response.files = []
+        current.response.body = Storage()
+        # use existing pattern from other tests: append URL
+        current.response.files.append(URL("a", "static", "css/file.css"))
+        # clear body and call include_files
+        current.response.body = io.StringIO()
+        current.response.include_files()
+        content = current.response.body.getvalue()
+        self.assertNotIn('nonce="', content)
+
+        # enable CSP and check nonce appears in SCRIPT and STYLE
+        current.response = Response()
+        current.request = Request(env={})
+        current.request.application = "a"
+        current.response.enable_csp()
+
+        s = SCRIPT('console.log(1)')
+        self.assertIn('nonce="%s"' % current.response.nonce, s.xml())
+        st = STYLE('body { color: blue }')
+        self.assertIn('nonce="%s"' % current.response.nonce, st.xml())
+
+        # include_files should inject nonce into link when enabled
+        current.response.files = []
+        current.response.files.append(URL("a", "static", "css/file.css"))
+        current.response.body = io.StringIO()
+        current.response.include_files()
+        content = current.response.body.getvalue()
+        self.assertIn('nonce="%s"' % current.response.nonce, content)
+        # nonce must appear as a proper attribute, not mangled into "/>"
+        # e.g. '<link ... / nonce="x">' would be invalid HTML
+        self.assertNotIn('/ nonce=', content)
+        self.assertIn('/>', content)
+
+        # same check for .less files
+        current.response.files = []
+        current.response.files.append(URL("a", "static", "css/file.less"))
+        current.response.body = io.StringIO()
+        current.response.include_files()
+        less_content = current.response.body.getvalue()
+        self.assertIn('nonce="%s"' % current.response.nonce, less_content)
+        self.assertNotIn('/ nonce=', less_content)
+        self.assertIn('/>', less_content)
+
+        # .js files should also get a nonce
+        current.response.files = []
+        current.response.files.append(URL("a", "static", "js/file.js"))
+        current.response.body = io.StringIO()
+        current.response.include_files()
+        js_content = current.response.body.getvalue()
+        self.assertIn('nonce="%s"' % current.response.nonce, js_content)
+
+        # extra policies are merged alongside the nonce
+        current.response = Response()
+        current.request = Request(env={})
+        current.request.application = "a"
+        current.response.enable_csp(script_src="'unsafe-inline'")
+        csp = current.response.headers["Content-Security-Policy"]
+        self.assertIn("'nonce-%s'" % current.response.nonce, csp)
+        self.assertIn("'unsafe-inline'", csp)
+        # nonce is still injected into SCRIPT tags
+        self.assertIn('nonce="%s"' % current.response.nonce, SCRIPT('alert(1)').xml())
+
+        # pre-existing CSP header is merged, not overwritten
+        current.response = Response()
+        current.request = Request(env={})
+        current.request.application = "a"
+        current.response.headers["Content-Security-Policy"] = "img-src 'self' https://cdn.example.com"
+        current.response.enable_csp()
+        csp = current.response.headers["Content-Security-Policy"]
+        self.assertIn("img-src", csp)
+        self.assertIn("https://cdn.example.com", csp)
+        self.assertIn("'nonce-%s'" % current.response.nonce, csp)
+
         # CAT(' ')
         self.assertEqual(CAT(" ").xml(), " ")
 
@@ -922,6 +1053,13 @@ class TestBareHelpers(unittest.TestCase):
         # TODO check tags content
         self.assertEqual(len(FORM("<>", _a="1", _b="2").as_xml()), 326)
 
+    def test_FORM_add_button_escapes_redirect_url(self):
+        form = FORM(INPUT(_type="submit", _value="Go"))
+        form.add_button("Cancel", "/path?x=bar'")
+        html = form.xml()
+        self.assertIn('window.location=&quot;/path?x=bar&#x27;&quot;;return false', html)
+        self.assertNotIn("window.location='", html)
+
     def test_BEAUTIFY(self):
         # self.assertEqual(BEAUTIFY(['a', 'b', {'hello': 'world'}]).xml(),
         #                 '<div><table><tr><td><div>a</div></td></tr><tr><td><div>b</div></td></tr><tr><td><div><table><tr><td style="font-weight:bold;vertical-align:top;">hello</td><td style="vertical-align:top;">:</td><td><div>world</div></td></tr></table></div></td></tr></table></div>')
@@ -1024,6 +1162,155 @@ class TestBareHelpers(unittest.TestCase):
             "<code class=\"python\">hello_world = 'Hello World!'</code>",
         )
         self.assertEqual(MARKMIN("<>").flatten(), "<>")
+        
+        # Test XSS protection: javascript: URLs must be blocked
+        # Regression test for is_unsafe() function with HTML5 whitespace handling
+        # Block basic javascript: URLs in MARKMIN syntax
+        output = MARKMIN("[[link javascript:alert(1)]]").xml()
+        self.assertIn("markmin_unsafe", output)
+        self.assertNotIn("<a href=\"javascript:", output)
+
+        # Block other active-content URL schemes in explicit links.
+        output = MARKMIN("[[link data:text/html,<script>alert(1)</script>]]").xml()
+        self.assertIn("markmin_unsafe", output)
+        self.assertNotIn("<a href=\"data:", output)
+
+        output = MARKMIN("[[link vbscript:msgbox(1)]]").xml()
+        self.assertIn("markmin_unsafe", output)
+        self.assertNotIn("<a href=\"vbscript:", output)
+        
+        # Allow safe HTTP URLs
+        output = MARKMIN("[[link http://example.com]]").xml()
+        self.assertIn('<a href="http://example.com"', output)
+        self.assertNotIn("markmin_unsafe", output)
+    
+    def test_MARKMIN_is_unsafe_whitespace_bypass(self):
+        # Test that the is_unsafe() function properly handles HTML5 whitespace
+        # This tests the fix for whitespace bypass in javascript: protocol detection
+        from gluon.contrib.markmin.markmin2html import is_unsafe
+        
+        # Basic javascript: should be detected
+        self.assertTrue(is_unsafe("javascript:alert(1)"))
+        
+        # javascript: with newline should be detected (HTML5 whitespace bypass prevention)
+        self.assertTrue(is_unsafe("java\nscript:alert(1)"))
+        
+        # javascript: with tab should be detected
+        self.assertTrue(is_unsafe("java\tscript:alert(1)"))
+        
+        # javascript: with form feed should be detected
+        self.assertTrue(is_unsafe("java\fscript:alert(1)"))
+        
+        # javascript: with carriage return should be detected
+        self.assertTrue(is_unsafe("java\rscript:alert(1)"))
+
+        # Other active-content schemes should be blocked too.
+        self.assertTrue(is_unsafe("vbscript:msgbox(1)"))
+        self.assertTrue(is_unsafe("data:text/html,<script>alert(1)</script>"))
+
+        # C0 controls should not bypass the scheme check.
+        self.assertTrue(is_unsafe("java\0script:alert(1)"))
+        self.assertTrue(is_unsafe("vb\x7fscript:msgbox(1)"))
+        
+        # Safe URLs should not be detected as unsafe
+        self.assertFalse(is_unsafe("http://example.com"))
+        self.assertFalse(is_unsafe("https://example.com"))
+        self.assertFalse(is_unsafe("mailto:test@example.com"))
+        self.assertFalse(is_unsafe("/relative/path"))
+
+    def test_MARKMIN_attribute_breakout_xss(self):
+        # A double quote inside a link target/title/alt/anchor must be escaped,
+        # otherwise it closes the surrounding "..." attribute and lets an
+        # attacker inject an event handler (XSS) -- a bypass of the
+        # javascript:-only is_unsafe() check. The quote belongs in markup, not
+        # attribute syntax, so it must come out as &quot; everywhere.
+
+        # image src: <img onerror=...> fires automatically (no user interaction)
+        output = MARKMIN('[[alt http://x"onerror="alert(1) img]]').xml()
+        self.assertNotIn('"onerror="alert(1)', output)
+        self.assertIn("&quot;onerror=&quot;alert(1)", output)
+
+        # link href
+        output = MARKMIN('[[click http://x"onmouseover="alert(1)]]').xml()
+        self.assertNotIn('"onmouseover="alert(1)', output)
+        self.assertIn("&quot;onmouseover=&quot;alert(1)", output)
+
+        # link title (the [extra] field)
+        output = MARKMIN('[[click [t"onmouseover="alert(1)] http://x]]').xml()
+        self.assertNotIn('"onmouseover="alert(1)', output)
+        self.assertIn('href="http://x"', output)
+
+        # anchor id
+        output = MARKMIN('[[name"onmouseover="alert(1)]]').xml()
+        self.assertNotIn('"onmouseover="alert(1)', output)
+
+        # legitimate links keep working unchanged
+        output = MARKMIN("[[web2py http://web2py.com]]").xml()
+        self.assertIn('<a href="http://web2py.com">web2py</a>', output)
+
+    def test_MARKMIN_media_autolink_title_xss(self):
+        # When a media item's title is itself an auto-url, it is reused as the
+        # target of a wrapping <a href="...">. The guard uses re.match (not
+        # anchored at the end), so a value like http://x" onmouseover="alert(1)
+        # still satisfies it; the title must be escaped so the double quote
+        # cannot break out of href="..." and inject an event handler (XSS).
+        output = MARKMIN(
+            '[[http://x.com" onmouseover="alert(1) http://img.com/a.png img]]'
+        ).xml()
+        self.assertNotIn('" onmouseover="alert(1)', output)
+        self.assertIn("&quot; onmouseover=&quot;alert(1)", output)
+
+        # A javascript: pseudo-url title must not become a clickable link;
+        # sub_media must reject it like sub_link does for the link target.
+        output = MARKMIN(
+            "[[javascript://%0aalert(1) http://img.com/a.png img]]"
+        ).xml()
+        self.assertNotIn('href="javascript:', output)
+
+        # legitimate auto-url title still wraps the image in a link
+        output = MARKMIN("[[http://example.com http://img.com/a.png img]]").xml()
+        self.assertIn(
+            '<a href="http://example.com"><img src="http://img.com/a.png" /></a>',
+            output,
+        )
+
+    def test_MARKMIN_code_meta_attribute_breakout_xss(self):
+        # The optional [id] part of a ``code``:cls[id] meta is captured as
+        # [^\]]*, so it can contain a double quote. That value ends up inside
+        # HTML attributes in three places of the meta/code rendering path
+        # (the <code> id, the colour <span> style, and the cite <a> href), so
+        # the quote must be escaped or it breaks out of the attribute and lets
+        # an attacker inject an event handler (XSS), just like the link/media
+        # paths already guard against.
+
+        # code block id attribute
+        output = MARKMIN('``hi``:cls[x" onmouseover="alert(1)]').xml()
+        self.assertNotIn('" onmouseover="alert(1)', output)
+        self.assertIn("&quot; onmouseover=&quot;alert(1)", output)
+
+        # colour span style attribute
+        output = MARKMIN('``hi``:c[red" onmouseover="alert(2)]').xml()
+        self.assertNotIn('" onmouseover="alert(2)', output)
+        self.assertIn("&quot; onmouseover=&quot;alert(2)", output)
+
+        # cite href attribute
+        output = MARKMIN('``x" onclick="alert(3)``:cite').xml()
+        self.assertNotIn('" onclick="alert(3)', output)
+        self.assertIn("&quot; onclick=&quot;alert(3)", output)
+
+        # legitimate metas keep rendering unchanged
+        self.assertIn(
+            '<code class="python" id="markmin_myid">hello</code>',
+            MARKMIN("``hello``:python[myid]").xml(),
+        )
+        self.assertIn(
+            '<span style="color: red;">red text</span>',
+            MARKMIN("``red text``:c[red]").xml(),
+        )
+        self.assertIn(
+            '<a href="#markmin_a" class="cite">a</a>',
+            MARKMIN("``a,b``:cite").xml(),
+        )
 
     def test_ASSIGNJS(self):
         # empty assignation
@@ -1032,6 +1319,16 @@ class TestBareHelpers(unittest.TestCase):
         self.assertEqual(ASSIGNJS(var1="1").xml(), 'var var1 = "1";\n')
         # int assignation
         self.assertEqual(ASSIGNJS(var2=2).xml(), "var var2 = 2;\n")
+
+    def test_SAFEJSON(self):
+        obj = {"x": "</script><img src=x onerror=alert(1)>"}
+        s = SAFEJSON(obj)
+        assert isinstance(s, SafeString)
+        xml = s.xml()
+        # ensure raw '</' does not appear
+        assert "</" not in xml
+        # ensure we used the unicode-escaped form
+        assert "\\u003c/" in xml
 
 
 class TestData(unittest.TestCase):

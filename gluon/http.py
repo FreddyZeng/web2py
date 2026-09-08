@@ -11,8 +11,19 @@ HTTP statuses helpers
 """
 
 import re
+from urllib.parse import quote as urllib_quote
+from xml.sax.saxutils import escape as xml_escape
 
-__all__ = ["HTTP", "redirect"]
+__all__ = [
+    "HTTP",
+    "redirect",
+    "content_disposition_filename",
+    "content_disposition_header",
+]
+
+# RFC 7230 token characters: the only bytes allowed in a Content-Disposition
+# disposition type (e.g. "attachment", "inline").
+CONTENT_DISPOSITION_TYPE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 
 defined_status = {
     200: "OK",
@@ -60,6 +71,23 @@ defined_status = {
 
 regex_status = re.compile(r"^\d{3} [0-9A-Z ]+$")
 regex_header_newlines = re.compile(r"[\r\n]")
+
+# URL schemes that run script when the value is assigned to window.location
+# (the client_side branch of redirect() emits web2py-redirect-location, which
+# web2py.js assigns to window.location) or opened from a Location header on
+# legacy browsers. They are never valid redirect targets.
+_UNSAFE_REDIRECT_SCHEMES = frozenset(("javascript", "vbscript", "data"))
+
+
+def _is_unsafe_redirect(location):
+    # Strip ASCII control characters and spaces the way browsers do before
+    # resolving a URL, so values like "java\tscript:..." cannot slip a
+    # dangerous scheme past the check.
+    cleaned = "".join(
+        c for c in location if ord(c) > 0x20 and ord(c) != 0x7F
+    ).lower()
+    scheme, has_scheme, _ = cleaned.partition(":")
+    return bool(has_scheme) and scheme in _UNSAFE_REDIRECT_SCHEMES
 
 
 class HTTP(Exception):
@@ -175,6 +203,10 @@ def redirect(location="", how=303, client_side=False, headers=None):
     if location:
         from gluon.globals import current
 
+        if _is_unsafe_redirect(location):
+            # Refuse a script-executing scheme instead of handing it to
+            # window.location; fall back to the root path.
+            location = "/"
         loc = location.replace("\r", "%0D").replace("\n", "%0A")
         if client_side and current.request.ajax:
             headers["web2py-redirect-location"] = loc
@@ -182,7 +214,10 @@ def redirect(location="", how=303, client_side=False, headers=None):
         else:
             headers["Location"] = loc
             raise HTTP(
-                how, 'You are being redirected <a href="%s">here</a>' % loc, **headers
+                how,
+                'You are being redirected <a href="%s">here</a>'
+                % xml_escape(loc, {'"': "&quot;"}),
+                **headers,
             )
     else:
         from gluon.globals import current
@@ -190,3 +225,22 @@ def redirect(location="", how=303, client_side=False, headers=None):
         if client_side and current.request.ajax:
             headers["web2py-component-command"] = "window.location.reload(true)"
             raise HTTP(200, **headers)
+
+
+def content_disposition_filename(filename):
+    if filename is None:
+        filename = ""
+    # Keep historical semantics for normal values while ensuring dangerous
+    # bytes are encoded before insertion in a quoted header parameter.
+    if isinstance(filename, bytes):
+        return urllib_quote(filename, safe=b"")
+    return urllib_quote(str(filename), safe="")
+
+
+def content_disposition_header(filename, disposition="attachment"):
+    if not CONTENT_DISPOSITION_TYPE.fullmatch(disposition):
+        raise ValueError("invalid Content-Disposition type: %r" % disposition)
+    return '%s; filename="%s"' % (
+        disposition,
+        content_disposition_filename(filename),
+    )

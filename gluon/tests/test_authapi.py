@@ -57,6 +57,29 @@ class TestAuthAPI(unittest.TestCase):
         result = self.auth.login(**{"username": "BarT", "password": "bart_password"})
         self.assertTrue(self.auth.is_logged_in())
 
+    def test_login_without_stored_password(self):
+        # users provisioned by an alternate login method (or by register_bare
+        # with no password) have no local password and must not be reachable
+        for stored in (None, ""):
+            uid = self.auth.table_user().insert(
+                first_name="Maggie",
+                last_name="Simpson",
+                username="maggie%s" % (stored is None),
+                email="maggie%s@simpson.com" % (stored is None),
+                password=stored,
+                registration_key="",
+            )
+            self.db.commit()
+            for candidate in (None, ""):
+                result = self.auth.login(
+                    **{
+                        "username": self.auth.table_user()[uid].username,
+                        "password": candidate,
+                    }
+                )
+                self.assertTrue(result["errors"] is not None)
+                self.assertFalse(self.auth.is_logged_in())
+
     def test_logout(self):
         self.auth.login(**{"username": "bart", "password": "bart_password"})
         self.assertTrue(self.auth.is_logged_in())
@@ -197,3 +220,23 @@ class TestAuthAPI(unittest.TestCase):
         lisa_id = result["user"]["id"]
         result = self.auth.verify_key(key=result["user"]["key"])
         self.assertEqual(self.auth.table_user()[lisa_id].registration_key, "pending")
+
+    def test_verify_key_rejects_reserved_states(self):
+        # registration_key doubles as a status column: "disabled"/"blocked"
+        # accounts and accounts still "pending" approval are refused by login().
+        # verify_key must not treat these reserved values as a verification key,
+        # otherwise passing key="disabled" matches such an account and clears
+        # the key, silently re-activating it.
+        for state in ("disabled", "blocked", "pending"):
+            uid = self.auth.table_user().insert(
+                first_name="Moe",
+                last_name="Szyslak",
+                username="moe_%s" % state,
+                email="moe_%s@simpson.com" % state,
+                password="moe_password",
+                registration_key=state,
+            )
+            self.db.commit()
+            result = self.auth.verify_key(key=state)
+            self.assertTrue(result["errors"] is not None)
+            self.assertEqual(self.auth.table_user()[uid].registration_key, state)

@@ -281,7 +281,7 @@ def try_rewrite_on_error(http_response, request, environ, ticket=None):
                     status,
                     ticket,
                     quote_plus(request.env.request_uri),
-                    request.url,
+                    quote_plus(request.url),
                 )
                 if uri.startswith("http://") or uri.startswith("https://"):
                     # make up a response
@@ -323,7 +323,7 @@ def try_redirect_on_error(http_object, request, ticket=None):
                         status,
                         ticket,
                         quote_plus(request.env.request_uri),
-                        request.url,
+                        quote_plus(request.url),
                     )
                 else:
                     url = "%s?code=%s&ticket=%s&requested_uri=%s&request_url=%s" % (
@@ -331,7 +331,7 @@ def try_redirect_on_error(http_object, request, ticket=None):
                         status,
                         ticket,
                         quote_plus(request.env.request_uri),
-                        request.url,
+                        quote_plus(request.url),
                     )
                 return HTTP(
                     303,
@@ -723,11 +723,12 @@ def regex_url_in(request, environ):
         items = filename.split("/", 1)
         if REGEX_VERSION.match(items[0]):
             version, filename = items
-        static_folder = pjoin(
+        static_folder = os.path.abspath(pjoin(
             global_settings.applications_parent, "applications", application, "static"
-        )
+        ))
         static_file = os.path.abspath(pjoin(static_folder, filename))
-        if not static_file.startswith(static_folder):
+        if not (static_file == static_folder
+                or static_file.startswith(static_folder + os.sep)):
             invalid_url(routes)
         return (static_file, version, environ)
     else:

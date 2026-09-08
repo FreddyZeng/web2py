@@ -62,7 +62,6 @@ from io import BytesIO, StringIO
 from pickle import DICT, EMPTY_DICT, MARK, Pickler
 from urllib import parse as urlparse
 from urllib.parse import parse_qs
-from urllib.parse import quote as urllib_quote
 
 from pydal.contrib import portalocker
 from pydal.utils import utcnow
@@ -72,10 +71,10 @@ from gluon import recfile
 from gluon.cache import CacheInRam
 from gluon.contenttype import contenttype
 from gluon.restricted import safe_load, safe_loads
-from gluon.contrib.multipart import MultipartParser, ParserError, parse_options_header
+from gluon.contrib.multipart import MultipartParser, MultipartError, parse_options_header
 from gluon.fileutils import up
 from gluon.html import PRE, TABLE, TR, URL, xmlescape
-from gluon.http import HTTP, redirect
+from gluon.http import HTTP, content_disposition_header, redirect
 from gluon.serializers import custom_json, json
 from gluon.settings import global_settings
 from gluon.storage import List, Storage
@@ -117,6 +116,63 @@ template_mapping = {
     "js:inline": js_inline,
 }
 
+template_mapping_csp = {
+    "css": '<link nonce="%s" href="%s" rel="stylesheet" type="text/css" />',
+    "js": '<script nonce="%s" src="%s" type="text/javascript"></script>',
+    "coffee": '<script nonce="%s" src="%s" type="text/coffee"></script>',
+    "ts": '<script nonce="%s" src="%s" type="text/typescript"></script>',
+    "less": '<link nonce="%s" href="%s" rel="stylesheet/less" type="text/css" />',
+    "css:inline": '<style nonce="%s" type="text/css">\n%s\n</style>',
+    "js:inline": '<script nonce="%s" type="text/javascript">\n%s\n</script>',
+}
+
+CSP_DIRECTIVE = re.compile(r"^[A-Za-z0-9-]+$")
+CSP_DIRECTIVE_TOKEN = re.compile(r"^[\x21-\x2B\x2D-\x3A\x3C-\x7E]+$")
+# Applied by Response.enable_csp() unless the caller or an already-set header
+# provides the directive. base-uri and form-action are a document and a
+# navigation directive, so neither falls back to default-src; object-src does
+# fall back, but only as far as default-src's 'self'.
+CSP_SECURE_DEFAULTS = (
+    ("base-uri", ("'self'",)),
+    ("form-action", ("'self'",)),
+    ("object-src", ("'none'",)),
+)
+CSP_STANDARD_DIRECTIVES = frozenset(
+    (
+        "base-uri",
+        "block-all-mixed-content",
+        "child-src",
+        "connect-src",
+        "default-src",
+        "fenced-frame-src",
+        "font-src",
+        "form-action",
+        "frame-ancestors",
+        "frame-src",
+        "img-src",
+        "manifest-src",
+        "media-src",
+        "navigate-to",
+        "object-src",
+        "prefetch-src",
+        "report-to",
+        "report-uri",
+        "require-sri-for",
+        "require-trusted-types-for",
+        "sandbox",
+        "script-src",
+        "script-src-attr",
+        "script-src-elem",
+        "style-src",
+        "style-src-attr",
+        "style-src-elem",
+        "trusted-types",
+        "upgrade-insecure-requests",
+        "webrtc",
+        "worker-src",
+    )
+)
+
 
 # IMPORTANT:
 # this is required so that pickled dict(s) and class.__dict__
@@ -136,6 +192,42 @@ def sorting_dumps(obj, protocol=None):
     file = StringIO()
     SortingPickler(file, protocol).dump(obj)
     return file.getvalue()
+
+
+def _validate_csp_directive(directive):
+    if not CSP_DIRECTIVE.match(directive):
+        raise ValueError("invalid CSP directive: %r" % directive)
+
+
+def _split_serialized_csp_list(serialized):
+    policies = []
+    start = 0
+    for match in re.finditer(r",([\t\n\f\r ]*)([A-Za-z0-9-]+)", serialized):
+        directive = match.group(2)
+        if (
+            match.group(1)
+            or directive.lower() in CSP_STANDARD_DIRECTIVES
+            or "-" in directive
+        ):
+            policies.append(serialized[start : match.start()].strip())
+            start = match.end(1)
+    policies.append(serialized[start:].strip())
+    return [policy for policy in policies if policy]
+
+
+def _normalize_csp_tokens(sources):
+    if isinstance(sources, str):
+        sources = sources.split()
+    elif sources is None:
+        sources = []
+    else:
+        sources = list(sources)
+    for source in sources:
+        if not isinstance(source, str):
+            raise TypeError("CSP directive tokens must be strings: %r" % (source,))
+        if not CSP_DIRECTIVE_TOKEN.match(source):
+            raise ValueError("invalid CSP directive token: %r" % source)
+    return sources
 
 
 # END #####################################################################
@@ -176,10 +268,7 @@ def copystream_progress(request, chunk_size=10**5):
         size = int(env["CONTENT_LENGTH"])
     except ValueError:
         raise HTTP(400, "Invalid Content-Length header")
-    try:  # Android requires this
-        dest = tempfile.NamedTemporaryFile()
-    except NotImplementedError:  # and GAE this
-        dest = tempfile.TemporaryFile()
+    dest = tempfile.TemporaryFile()
     if "X-Progress-ID" not in request.get_vars:
         copystream(source, dest, size, chunk_size)
         return dest
@@ -309,11 +398,20 @@ class Request(Storage):
                 ct, opts = parse_options_header(content_type)
                 boundary = opts.get("boundary")
                 charset = opts.get("charset", "utf-8")
-                parser = iter(
-                    MultipartParser(
-                        body, boundary, content_length=content_length, charset=charset
+                # The boundary is a required Content-Type parameter. Without it
+                # the parser cannot be constructed (and would raise TypeError),
+                # so a missing boundary simply yields no parseable parts.
+                if boundary:
+                    parser = iter(
+                        MultipartParser(
+                            body,
+                            boundary,
+                            content_length=content_length,
+                            charset=charset,
+                        )
                     )
-                )
+                else:
+                    parser = iter([])
                 while True:
                     try:
                         part = next(parser)
@@ -334,7 +432,15 @@ class Request(Storage):
                                 if part.name not in post_vars
                                 else listify(post_vars[part.name]) + [value]
                             )
-                    except (StopIteration, ParserError):
+                    except StopIteration:
+                        break
+                    except (MultipartError, UnicodeError, LookupError):
+                        # A malformed multipart body, a reached parser limit
+                        # (e.g. too many parts), or an invalid/unknown charset in
+                        # a part header. Stop parsing and keep whatever was
+                        # decoded so far, instead of letting the parser exception
+                        # escape parse_post_vars as an HTTP 500. This matches the
+                        # lenient behaviour previously applied to ParserError.
                         break
                 body.seek(0)
             # Handle application/x-www-form-urlencoded
@@ -568,6 +674,67 @@ class Response(Storage):
         self.delimiters = ("{{", "}}")
         self.formstyle = "table3cols"
         self.form_label_separator = ": "
+        self._csp_enabled = False
+
+    @property
+    def nonce(self):
+        if "nonce" not in self:
+            self["nonce"] = web2py_uuid()
+        return self["nonce"]
+
+    def enable_csp(self, report_only=False, **policies):
+        """Emit a per-request nonce-based Content-Security-Policy header.
+
+        With report_only=True the policy goes out as
+        Content-Security-Policy-Report-Only, so violations are reported by the
+        browser without being blocked. Nonces are still emitted, otherwise the
+        report would not describe what enforcement is going to do.
+        """
+        self._csp_enabled = True
+        header = (
+            "Content-Security-Policy-Report-Only"
+            if report_only
+            else "Content-Security-Policy"
+        )
+        existing = self.headers.get(header)
+        p = {}
+        if existing:
+            for policy in _split_serialized_csp_list(existing):
+                for directive in policy.split(";"):
+                    directive = directive.strip()
+                    if not directive:
+                        continue
+                    bits = directive.split()
+                    if bits:
+                        directive = bits[0].lower()
+                        _validate_csp_directive(directive)
+                        p[directive] = _normalize_csp_tokens(bits[1:])
+
+        def merge(directive, sources):
+            directive = directive.replace("_", "-").lower()
+            _validate_csp_directive(directive)
+            sources = _normalize_csp_tokens(sources)
+            if directive not in p:
+                p[directive] = []
+            for s in sources:
+                if s not in p[directive]:
+                    p[directive].append(s)
+
+        if "default-src" not in p:
+            merge("default-src", ["'self'"])
+        n = self.nonce
+        merge("script-src", ["'self'", "'nonce-%s'" % n])
+        merge("style-src", ["'self'", "'nonce-%s'" % n])
+        supplied = set(k.replace("_", "-").lower() for k in policies)
+        for directive, sources in CSP_SECURE_DEFAULTS:
+            if directive not in p and directive not in supplied:
+                merge(directive, sources)
+        for k, v in policies.items():
+            merge(k, v)
+
+        self.headers[header] = "; ".join(
+            "%s %s" % (k, " ".join(v)) for k, v in p.items()
+        )
 
     def write(self, data, escape=True):
         if not escape:
@@ -616,8 +783,8 @@ class Response(Storage):
                 )
             else:
                 s += '<meta name="%s" content="%s" />\n' % (
-                    k,
-                    xmlescape(str(v)),
+                    xmlescape(k),
+                    xmlescape(v),
                 )  # FIXME
         self.write(s, escape=False)
 
@@ -700,6 +867,13 @@ class Response(Storage):
                         files[i] = call_minify()
 
         def static_map(s, item):
+            def template_values(file_type, values):
+                if not isinstance(values, tuple):
+                    values = (values,)
+                if not file_type.endswith(":inline"):
+                    values = tuple(xmlescape(value) for value in values)
+                return values
+
             if isinstance(item, str):
                 f = item.lower().split("?")[0]
                 ext = f.rpartition(".")[2]
@@ -711,14 +885,26 @@ class Response(Storage):
                     item = item.replace(
                         "/static/", "/static/_%s/" % self.static_version, 1
                     )
-                tmpl = template_mapping.get(ext)
+                if self._csp_enabled:
+                    tmpl = template_mapping_csp.get(ext)
+                else:
+                    tmpl = template_mapping.get(ext)
                 if tmpl:
-                    s.append(tmpl % item)
+                    if self._csp_enabled:
+                        s.append(tmpl % (self.nonce, xmlescape(item)))
+                    else:
+                        s.append(tmpl % xmlescape(item))
             elif isinstance(item, (list, tuple)):
                 f = item[0]
-                tmpl = template_mapping.get(f)
+                if self._csp_enabled:
+                    tmpl = template_mapping_csp.get(f)
+                else:
+                    tmpl = template_mapping.get(f)
                 if tmpl:
-                    s.append(tmpl % item[1])
+                    if self._csp_enabled:
+                        s.append(tmpl % ((self.nonce,) + template_values(f, item[1])))
+                    else:
+                        s.append(tmpl % template_values(f, item[1]))
 
         s = []
         for item in files:
@@ -763,12 +949,7 @@ class Response(Storage):
         # for attachment settings and backward compatibility
         keys = [item.lower() for item in headers]
         if attachment:
-            # FIXME: should be done like in next download method
-            if filename is None:
-                attname = ""
-            else:
-                attname = filename
-            headers["Content-Disposition"] = 'attachment; filename="%s"' % attname
+            headers["Content-Disposition"] = content_disposition_header(filename)
 
         if not request:
             request = current.request
@@ -856,11 +1037,8 @@ class Response(Storage):
         if download_filename is None:
             download_filename = filename
         if attachment:
-            # Browsers still don't have a simple uniform way to have non ascii
-            # characters in the filename so for now we are percent encoding it
-            download_filename = urllib_quote(download_filename)
-            headers["Content-Disposition"] = (
-                'attachment; filename="%s"' % download_filename.replace('"', '\\"')
+            headers["Content-Disposition"] = content_disposition_header(
+                download_filename
             )
         return self.stream(stream, chunk_size=chunk_size, request=request)
 
@@ -1131,6 +1309,9 @@ class Session(Storage):
                             "sessions",
                             response.session_id,
                         )
+                        oc = os.path.basename(response.session_filename).split("-")[0]
+                        if check_client and response.session_client != oc:
+                            raise Exception("cookie attack")
                         response.session_file = recfile.open(
                             response.session_filename, "rb+"
                         )
@@ -1146,9 +1327,6 @@ class Session(Storage):
                         )
                         self.update(session_data)
                         response.session_file.seek(0)
-                        oc = response.session_filename.split("/")[-1].split("-")[0]
-                        if check_client and response.session_client != oc:
-                            raise Exception("cookie attack")
                     except Exception:
                         response.session_id = None
             if not response.session_id:
@@ -1205,6 +1383,9 @@ class Session(Storage):
                 if record_id:
                     row = table(record_id, unique_key=unique_key)
                     # Make sure the session data exists in the database
+                    if row and check_client:
+                        if row.client_ip != response.session_client:
+                            row = None
                     if row:
                         # rows[0].update_record(locked=True)
                         # Unpickle the data
@@ -1319,15 +1500,7 @@ class Session(Storage):
             else:
                 response.session_new = True
 
-    def _fixup_before_save(self):
-        response = current.response
-        rcookies = response.cookies
-        scookies = rcookies.get(response.session_id_name)
-        if not scookies:
-            return
-        if self._forget:
-            del rcookies[response.session_id_name]
-            return
+    def _set_cookie_security_attrs(self, scookies):
         if self.get("httponly_cookies", True):
             scookies["HttpOnly"] = True
         if self._secure:
@@ -1342,6 +1515,20 @@ class Session(Storage):
                 # Python version 3.7 and lower needs this
                 Cookie.Morsel._reserved["samesite"] = "SameSite"
             scookies["samesite"] = self._same_site
+
+    def _fixup_before_save(self):
+        response = current.response
+        rcookies = response.cookies
+        scookies = rcookies.get(response.session_id_name)
+        if self._forget:
+            if scookies:
+                del rcookies[response.session_id_name]
+            return
+        if scookies:
+            self._set_cookie_security_attrs(scookies)
+        data_cookie = rcookies.get(response.session_data_name)
+        if data_cookie:
+            self._set_cookie_security_attrs(data_cookie)
 
     def clear_session_cookies(self):
         request = current.request

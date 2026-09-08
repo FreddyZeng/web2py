@@ -7,12 +7,21 @@
 
 
 import re
+import os
+import shutil
+import tempfile
 import unittest
+from http.cookies import SimpleCookie
 from io import BytesIO
 
-from gluon import URL
-from gluon.globals import Request, Response, Session
+from pydal import DAL
+
+from gluon.html import XML, URL, SCRIPT
+from gluon.globals import current, Request, Response, Session
+from gluon.settings import global_settings
+from gluon.http import HTTP
 from gluon.rewrite import regex_url_in
+from gluon.streamer import stream_file_or_304_or_206
 
 
 def setup_clean_session():
@@ -29,6 +38,24 @@ def setup_clean_session():
     current.request = request
     current.response = response
     current.session = session
+    return current
+
+
+def setup_clean_cookie_session():
+    request = Request(env={})
+    request.application = "a"
+    request.controller = "c"
+    request.function = "f"
+    request.folder = "applications/admin"
+    response = Response()
+    session = Session()
+
+    from gluon.globals import current
+
+    current.request = request
+    current.response = response
+    current.session = session
+    session.connect(request, response, cookie_key="secret")
     return current
 
 
@@ -93,6 +120,8 @@ class testResponse(unittest.TestCase):
             raise self.failureException(msg)
 
     def test_include_files(self):
+        setup_clean_session()
+
         def return_includes(response, extensions=None):
             response.include_files(extensions)
             return response.body.getvalue()
@@ -225,12 +254,288 @@ class testResponse(unittest.TestCase):
             '<script src="http://maps.google.com/maps/api/js?sensor=false" type="text/javascript"></script>',
         )
 
+    def test_include_files_escapes_url_attributes(self):
+        setup_clean_session()
+
+        def return_includes(response):
+            response.include_files()
+            return response.body.getvalue()
+
+        malicious = 'https://cdn.example.com/app.js?x=" onerror="alert(1)'
+
+        response = Response()
+        response.files.append(malicious)
+        content = return_includes(response)
+        self.assertIn(
+            "https://cdn.example.com/app.js?x=&quot; onerror=&quot;alert(1)", content
+        )
+        self.assertNotIn('onerror="alert(1)', content)
+
+        response = Response()
+        response.files.append(("js", malicious))
+        content = return_includes(response)
+        self.assertIn(
+            "https://cdn.example.com/app.js?x=&quot; onerror=&quot;alert(1)", content
+        )
+        self.assertNotIn('onerror="alert(1)', content)
+
+        response = Response()
+        response.enable_csp()
+        response.files.append(("js", malicious))
+        content = return_includes(response)
+        self.assertIn('nonce="%s"' % response.nonce, content)
+        self.assertIn(
+            "https://cdn.example.com/app.js?x=&quot; onerror=&quot;alert(1)", content
+        )
+        self.assertNotIn('onerror="alert(1)', content)
+
+        response = Response()
+        response.files.append(("js", (malicious,)))
+        content = return_includes(response)
+        self.assertIn(
+            "https://cdn.example.com/app.js?x=&quot; onerror=&quot;alert(1)", content
+        )
+        self.assertNotIn('onerror="alert(1)', content)
+
+        response = Response()
+        response.enable_csp()
+        response.files.append(("js", (malicious,)))
+        content = return_includes(response)
+        self.assertIn('nonce="%s"' % response.nonce, content)
+        self.assertIn(
+            "https://cdn.example.com/app.js?x=&quot; onerror=&quot;alert(1)", content
+        )
+        self.assertNotIn('onerror="alert(1)', content)
+
         response = Response()
         response.files.append(
             ("js1", "http://maps.google.com/maps/api/js?sensor=false")
         )
         content = return_includes(response)
         self.assertEqual(content, "")
+
+    def test_enable_csp_rejects_injected_policy_tokens(self):
+        response = Response()
+        with self.assertRaises(ValueError):
+            response.enable_csp(script_src="'self'; img-src *")
+
+        response = Response()
+        response.headers["Content-Security-Policy"] = "script>src 'self'"
+        with self.assertRaises(ValueError):
+            response.enable_csp()
+
+        response = Response()
+        response.headers["Content-Security-Policy"] = "report-to group,name"
+        with self.assertRaises(ValueError):
+            response.enable_csp()
+
+        response = Response()
+        with self.assertRaises(ValueError):
+            response.enable_csp(report_to="group,name")
+
+        response = Response()
+        response.headers["Content-Security-Policy"] = "report-to group,name"
+        with self.assertRaises(ValueError):
+            response.enable_csp()
+
+        response = Response()
+        with self.assertRaises(ValueError):
+            response.enable_csp(script_src="https://good.example/\x00evil")
+
+        response = Response()
+        response.headers["Content-Security-Policy"] = "default-src 'self'; report-to group,name"
+        with self.assertRaises(ValueError):
+            response.enable_csp()
+
+    def test_enable_csp_rejects_non_string_iterable_tokens(self):
+        for invalid in ([None], [123], [b"foo"]):
+            response = Response()
+            with self.assertRaises(TypeError):
+                response.enable_csp(script_src=invalid)
+
+    def test_enable_csp_accepts_valid_policy_tokens(self):
+        response = Response()
+        response.enable_csp(
+            script_src=(
+                "'self' 'none' 'unsafe-inline' 'unsafe-eval' "
+                "'nonce-abcDEF0123+/_=' "
+                "'sha256-abcDEF0123+/_=' "
+                "*.example.com https://cdn.example.com blob: data: ws: wss:"
+            ),
+            report_uri="https://example.com/report",
+            report_to="csp-endpoint",
+            sandbox="allow-scripts allow-same-origin",
+            upgrade_insecure_requests="",
+        )
+        csp = response.headers["Content-Security-Policy"]
+        self.assertIn("'self'", csp)
+        self.assertIn("'unsafe-inline'", csp)
+        self.assertIn("'nonce-abcDEF0123+/_='", csp)
+        self.assertIn("'sha256-abcDEF0123+/_='", csp)
+        self.assertIn("*.example.com", csp)
+        self.assertIn("blob:", csp)
+        self.assertIn("data:", csp)
+        self.assertIn("ws:", csp)
+        self.assertIn("wss:", csp)
+        self.assertIn("report-uri https://example.com/report", csp)
+        self.assertIn("report-to csp-endpoint", csp)
+        self.assertIn("sandbox allow-scripts allow-same-origin", csp)
+        self.assertIn("upgrade-insecure-requests", csp)
+
+    def test_enable_csp_report_only_uses_the_report_only_header(self):
+        response = Response()
+        response.enable_csp(report_only=True)
+        self.assertIn("Content-Security-Policy-Report-Only", response.headers)
+        self.assertNotIn("Content-Security-Policy", response.headers)
+        csp = response.headers["Content-Security-Policy-Report-Only"]
+        self.assertIn("default-src 'self'", csp)
+        self.assertIn("'nonce-%s'" % response.nonce, csp)
+
+    def test_enable_csp_report_only_still_emits_nonces(self):
+        # report-only is only useful if the page renders the same nonces it
+        # would render under enforcement, otherwise the report describes a
+        # policy nobody intends to ship.
+        response = Response()
+        current.response = response
+        response.enable_csp(report_only=True)
+        rendered = SCRIPT("var x = 1;").xml()
+        self.assertIn('nonce="%s"' % response.nonce, rendered)
+        self.assertIn(
+            "'nonce-%s'" % response.nonce,
+            response.headers["Content-Security-Policy-Report-Only"],
+        )
+
+    def test_enable_csp_report_only_reads_its_own_existing_header(self):
+        response = Response()
+        response.headers["Content-Security-Policy-Report-Only"] = "img-src 'self'"
+        response.enable_csp(report_only=True)
+        csp = response.headers["Content-Security-Policy-Report-Only"]
+        self.assertIn("img-src 'self'", csp)
+        self.assertIn("script-src", csp)
+        self.assertNotIn("Content-Security-Policy", response.headers)
+
+    def test_enable_csp_enforcing_is_unchanged_by_default(self):
+        response = Response()
+        response.enable_csp()
+        self.assertIn("Content-Security-Policy", response.headers)
+        self.assertNotIn("Content-Security-Policy-Report-Only", response.headers)
+
+    @staticmethod
+    def _csp_directive(csp, name):
+        for directive in csp.split(";"):
+            bits = directive.split()
+            if bits and bits[0] == name:
+                return " ".join(bits[1:])
+        return None
+
+    def test_enable_csp_sets_directives_without_default_src_fallback(self):
+        # base-uri and form-action do not fall back to default-src, so a nonce
+        # policy that omits them still permits an injected <base> to retarget
+        # every relative URL, including FORM's default action="#".
+        response = Response()
+        response.enable_csp()
+        csp = response.headers["Content-Security-Policy"]
+        self.assertEqual("'self'", self._csp_directive(csp, "base-uri"))
+        self.assertEqual("'self'", self._csp_directive(csp, "form-action"))
+        self.assertEqual("'none'", self._csp_directive(csp, "object-src"))
+        self.assertEqual("'self'", self._csp_directive(csp, "default-src"))
+        self.assertEqual(
+            "'self' 'nonce-%s'" % response.nonce,
+            self._csp_directive(csp, "script-src"),
+        )
+
+    def test_enable_csp_defaults_do_not_override_caller(self):
+        response = Response()
+        response.enable_csp(base_uri="'none'", form_action="https://pay.example")
+        csp = response.headers["Content-Security-Policy"]
+        self.assertEqual("'none'", self._csp_directive(csp, "base-uri"))
+        self.assertEqual(
+            "https://pay.example", self._csp_directive(csp, "form-action")
+        )
+        # a directive the caller did not mention still gets its default
+        self.assertEqual("'none'", self._csp_directive(csp, "object-src"))
+
+    def test_enable_csp_defaults_do_not_override_existing_header(self):
+        response = Response()
+        response.headers["Content-Security-Policy"] = "base-uri https://cdn.example"
+        response.enable_csp()
+        csp = response.headers["Content-Security-Policy"]
+        # merge() appends, so a missing guard shows up as the default tacked on
+        # the end of the caller's value, not in front of it.
+        self.assertEqual(
+            "https://cdn.example", self._csp_directive(csp, "base-uri")
+        )
+        self.assertEqual("'self'", self._csp_directive(csp, "form-action"))
+
+    def test_enable_csp_directives_are_case_insensitive(self):
+        response = Response()
+        response.enable_csp(
+            **{
+                "BASE_URI": "https://cdn.example",
+                "Form_Action": "https://pay.example",
+                "OBJECT_SRC": "'self'",
+            }
+        )
+        csp = response.headers["Content-Security-Policy"]
+        self.assertEqual(
+            "https://cdn.example", self._csp_directive(csp, "base-uri")
+        )
+        self.assertEqual(
+            "https://pay.example", self._csp_directive(csp, "form-action")
+        )
+        self.assertEqual("'self'", self._csp_directive(csp, "object-src"))
+
+        response = Response()
+        response.headers["Content-Security-Policy"] = (
+            "BASE-URI https://cdn.example; Form-Action https://pay.example; "
+            "OBJECT-SRC 'self'"
+        )
+        response.enable_csp()
+        csp = response.headers["Content-Security-Policy"]
+        self.assertEqual(
+            "https://cdn.example", self._csp_directive(csp, "base-uri")
+        )
+        self.assertEqual(
+            "https://pay.example", self._csp_directive(csp, "form-action")
+        )
+        self.assertEqual("'self'", self._csp_directive(csp, "object-src"))
+
+        response = Response()
+        response.headers["Content-Security-Policy"] = "BASE_URI https://cdn.example"
+        with self.assertRaises(ValueError):
+            response.enable_csp()
+
+    def test_enable_csp_accepts_existing_policy_lists(self):
+        response = Response()
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self', report-uri https://example.com/report"
+        )
+        response.enable_csp(report_to="csp-endpoint")
+        csp = response.headers["Content-Security-Policy"]
+        self.assertIn("default-src 'self'", csp)
+        self.assertIn("report-uri https://example.com/report", csp)
+        self.assertIn("report-to csp-endpoint", csp)
+        self.assertIn("script-src 'self'", csp)
+        self.assertIn("style-src 'self'", csp)
+
+        response = Response()
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self',report-uri https://example.com/report"
+        )
+        response.enable_csp(report_to="csp-endpoint")
+        csp = response.headers["Content-Security-Policy"]
+        self.assertIn("default-src 'self'", csp)
+        self.assertIn("report-uri https://example.com/report", csp)
+        self.assertIn("report-to csp-endpoint", csp)
+
+        response = Response()
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self',x-foo bar"
+        )
+        response.enable_csp()
+        csp = response.headers["Content-Security-Policy"]
+        self.assertIn("default-src 'self'", csp)
+        self.assertIn("x-foo bar", csp)
 
     def test_cookies(self):
         current = setup_clean_session()
@@ -293,6 +598,225 @@ class testResponse(unittest.TestCase):
         cookie = str(current.response.cookies)
         self.assertTrue("samesite=strict" in cookie.lower())
 
+    def test_cookie_session_data_cookie_gets_security_attributes(self):
+        current = setup_clean_cookie_session()
+        current.session.user_id = 1
+
+        self.assertTrue(
+            current.session._try_store_in_cookie_or_file(
+                current.request, current.response
+            )
+        )
+        current.session._fixup_before_save()
+
+        cookie = str(
+            current.response.cookies[current.response.session_data_name]
+        ).lower()
+        self.assertIn("httponly", cookie)
+        self.assertIn("samesite=lax", cookie)
+
+    def test_cookie_session_data_cookie_gets_secure_attribute(self):
+        current = setup_clean_cookie_session()
+        current.session.user_id = 1
+        current.session.secure()
+
+        current.session._try_store_in_cookie_or_file(current.request, current.response)
+        current.session._fixup_before_save()
+
+        cookie = str(
+            current.response.cookies[current.response.session_data_name]
+        ).lower()
+        self.assertIn("secure", cookie)
+
+    def test_forget_deletes_session_id_cookie(self):
+        current = setup_clean_session()
+        current.session._fixup_before_save()
+        self.assertIn(
+            current.response.session_id_name, current.response.cookies
+        )
+
+        current.session.forget()
+        current.session._fixup_before_save()
+        self.assertNotIn(
+            current.response.session_id_name, current.response.cookies
+        )
+
+    def test_stream_attachment_filename_encodes_quote(self):
+        response = Response()
+        request = Request(env={})
+        payload = BytesIO(b"hello")
+        filename = 'a"b.txt'
+
+        response.stream(payload, request=request, attachment=True, filename=filename)
+
+        disposition = response.headers["Content-Disposition"]
+        self.assertEqual(
+            disposition,
+            'attachment; filename="a%22b.txt"',
+        )
+
+    def test_stream_attachment_filename_encodes_semicolon(self):
+        response = Response()
+        request = Request(env={})
+        payload = BytesIO(b"hello")
+        filename = "a; filename=evil.txt"
+
+        response.stream(payload, request=request, attachment=True, filename=filename)
+
+        disposition = response.headers["Content-Disposition"]
+        self.assertEqual(
+            disposition,
+            'attachment; filename="a%3B%20filename%3Devil.txt"',
+        )
+        self.assertEqual(disposition.count(";"), 1)
+        self.assertNotIn("filename=evil.txt", disposition)
+
+    def test_stream_attachment_filename_encodes_crlf(self):
+        response = Response()
+        request = Request(env={})
+        payload = BytesIO(b"hello")
+        filename = "a.txt\r\nX-Evil: yes"
+
+        response.stream(payload, request=request, attachment=True, filename=filename)
+
+        disposition = response.headers["Content-Disposition"]
+        self.assertEqual(
+            disposition,
+            'attachment; filename="a.txt%0D%0AX-Evil%3A%20yes"',
+        )
+        self.assertNotIn("\r", disposition)
+        self.assertNotIn("\n", disposition)
+
+    def test_stream_attachment_safe_filenames_compatibility(self):
+        request = Request(env={})
+        payload = BytesIO(b"hello")
+        cases = [
+            ("report.csv", 'attachment; filename="report.csv"'),
+            ("my report.txt", 'attachment; filename="my%20report.txt"'),
+            ("caf\u00e9.txt", 'attachment; filename="caf%C3%A9.txt"'),
+            ("100%done.txt", 'attachment; filename="100%25done.txt"'),
+        ]
+        for filename, expected in cases:
+            response = Response()
+            response.stream(payload, request=request, attachment=True, filename=filename)
+            self.assertEqual(response.headers["Content-Disposition"], expected)
+
+    def test_stream_attachment_bytes_filename_compatibility(self):
+        response = Response()
+        request = Request(env={})
+        payload = BytesIO(b"hello")
+
+        response.stream(payload, request=request, attachment=True, filename=b"caf\xc3\xa9.txt")
+
+        self.assertEqual(
+            response.headers["Content-Disposition"],
+            'attachment; filename="caf%C3%A9.txt"',
+        )
+
+    def test_stream_file_range(self):
+        fd, path = tempfile.mkstemp()
+        try:
+            os.write(fd, b"0123456789")
+            os.close(fd)
+            request = Request(env={})
+            request.env.http_if_modified_since = None
+            request.env.http_accept_encoding = ""
+            request.env.web2py_use_wsgi_file_wrapper = False
+
+            # Invalid ranges -> 416
+            for r in ["bytes=8-3", "bytes=999-", "bytes=10-10"]:
+                request.env.http_range = r
+                with self.assertRaises(HTTP) as ctx:
+                    stream_file_or_304_or_206(path, request=request, headers={})
+                self.assertEqual(ctx.exception.status, 416)
+                self.assertEqual(ctx.exception.headers.get("Content-Range"), "bytes */10")
+
+            # Valid range -> 206
+            request.env.http_range = "bytes=0-4"
+            with self.assertRaises(HTTP) as ctx:
+                stream_file_or_304_or_206(path, request=request, headers={})
+            self.assertEqual(ctx.exception.status, 206)
+            self.assertEqual(ctx.exception.headers.get("Content-Range"), "bytes 0-4/10")
+            self.assertEqual(ctx.exception.headers.get("Content-Length"), "5")
+            b"".join(ctx.exception.body)  # exhaust the streamer so its finally: stream.close() runs cleanly
+
+            # Suffix byte ranges request the last N bytes.
+            request.env.http_range = "bytes=-4"
+            with self.assertRaises(HTTP) as ctx:
+                stream_file_or_304_or_206(path, request=request, headers={})
+            self.assertEqual(ctx.exception.status, 206)
+            self.assertEqual(ctx.exception.headers.get("Content-Range"), "bytes 6-9/10")
+            self.assertEqual(ctx.exception.headers.get("Content-Length"), "4")
+            self.assertEqual(b"".join(ctx.exception.body), b"6789")
+
+            # A suffix larger than the file is clamped to the whole file.
+            request.env.http_range = "bytes=-9999"
+            with self.assertRaises(HTTP) as ctx:
+                stream_file_or_304_or_206(path, request=request, headers={})
+            self.assertEqual(ctx.exception.status, 206)
+            self.assertEqual(ctx.exception.headers.get("Content-Range"), "bytes 0-9/10")
+            self.assertEqual(ctx.exception.headers.get("Content-Length"), "10")
+            self.assertEqual(b"".join(ctx.exception.body), b"0123456789")
+
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_stream_file_range_wsgi_file_wrapper(self):
+        # A 206 must not exceed the advertised Content-Length even when a
+        # wsgi.file_wrapper is used: the wrapper streams the seeked file to EOF,
+        # so the callee has to bound the body itself for partial responses.
+        class FileWrapper(object):
+            def __init__(self, filelike, blksize=8192):
+                self.filelike = filelike
+                self.blksize = blksize
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                data = self.filelike.read(self.blksize)
+                if data:
+                    return data
+                self.filelike.close()
+                raise StopIteration
+
+        fd, path = tempfile.mkstemp()
+        try:
+            os.write(fd, b"0123456789")
+            os.close(fd)
+            request = Request(env={})
+            request.env.http_if_modified_since = None
+            request.env.http_accept_encoding = ""
+            request.env.web2py_use_wsgi_file_wrapper = True
+            request.env.wsgi_file_wrapper = FileWrapper
+
+            request.env.http_range = "bytes=0-4"
+            with self.assertRaises(HTTP) as ctx:
+                stream_file_or_304_or_206(path, request=request, headers={})
+            self.assertEqual(ctx.exception.status, 206)
+            self.assertEqual(ctx.exception.headers.get("Content-Length"), "5")
+            self.assertEqual(b"".join(ctx.exception.body), b"01234")
+
+            # A full-content (200) response still goes through the wrapper.
+            request.env.http_range = None
+            with self.assertRaises(HTTP) as ctx:
+                stream_file_or_304_or_206(path, request=request, headers={})
+            self.assertEqual(ctx.exception.status, 200)
+            self.assertEqual(ctx.exception.headers.get("Content-Length"), "10")
+            self.assertEqual(b"".join(ctx.exception.body), b"0123456789")
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            if os.path.exists(path):
+                os.remove(path)
+
     def test_include_meta(self):
         response = Response()
         response.meta["web2py"] = "web2py"
@@ -301,9 +825,109 @@ class testResponse(unittest.TestCase):
             response.body.getvalue(), '\n<meta name="web2py" content="web2py" />\n'
         )
         response = Response()
+        response.meta['description" onload="alert(1)'] = "<x>"
+        response.include_meta()
+        self.assertEqual(
+            response.body.getvalue(),
+            '\n<meta name="description&quot; onload=&quot;alert(1)" content="&lt;x&gt;" />\n',
+        )
+        response = Response()
         response.meta["meta_dict"] = {"tag_name": "tag_value"}
         response.include_meta()
         self.assertEqual(response.body.getvalue(), '\n<meta tag_name="tag_value" />\n')
+
+        # regression test for XML object support (preserves trusted HTML)
+        response = Response()
+        response.meta["description"] = XML("<b>bold</b>")
+        response.include_meta()
+        self.assertEqual(
+            response.body.getvalue(), '\n<meta name="description" content="<b>bold</b>" />\n'
+        )
+
+
+class testSessionCheckClient(unittest.TestCase):
+    """check_client=True must reject a session replayed from another client."""
+
+    def _request(self, client):
+        request = Request(env={})
+        request.application = "a"
+        request.controller = "c"
+        request.function = "f"
+        request.folder = self.folder
+        request.client = client
+        request.is_local = False
+        return request
+
+    def _connect(self, client, session_id=None, db=None):
+        from gluon.globals import current
+
+        request = self._request(client)
+        if session_id:
+            cookie = SimpleCookie()
+            cookie["session_id_a"] = session_id
+            request.cookies = cookie
+        response = Response()
+        session = Session()
+        current.request = request
+        current.response = response
+        current.session = session
+        session.connect(request, response, db=db, check_client=True)
+        return request, response, session
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.folder = os.path.join(self.tmpdir, "applications", "a")
+        os.makedirs(os.path.join(self.folder, "sessions"))
+        # connect() registers db-backed apps here; a leftover entry would make
+        # the file-based tests take the db branch
+        global_settings.db_sessions.discard("a")
+
+    def tearDown(self):
+        # Windows can't unlink an open/locked session file; ignore cleanup errors.
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        global_settings.db_sessions.discard("a")
+
+    def test_file_session_from_other_client_is_not_loaded(self):
+        request, response, session = self._connect("1.1.1.1")
+        session.auth = "victim"
+        session._try_store_in_cookie_or_file(request, response)
+
+        _, response2, session2 = self._connect(
+            "9.9.9.9", session_id=response.session_id
+        )
+        self.assertIsNone(session2.get("auth"))
+        self.assertTrue(response2.session_new)
+
+    def test_file_session_from_same_client_is_loaded(self):
+        request, response, session = self._connect("1.1.1.1")
+        session.auth = "victim"
+        session._try_store_in_cookie_or_file(request, response)
+
+        _, _, session2 = self._connect("1.1.1.1", session_id=response.session_id)
+        self.assertEqual(session2.get("auth"), "victim")
+
+    def test_db_session_from_other_client_is_not_loaded(self):
+        db = DAL("sqlite:memory")
+        request, response, session = self._connect("1.1.1.1", db=db)
+        session.auth = "victim"
+        session._try_store_in_db(request, response)
+
+        _, response2, session2 = self._connect(
+            "9.9.9.9", session_id=response.session_id, db=db
+        )
+        self.assertIsNone(session2.get("auth"))
+        self.assertTrue(response2.session_new)
+
+    def test_db_session_from_same_client_is_loaded(self):
+        db = DAL("sqlite:memory")
+        request, response, session = self._connect("1.1.1.1", db=db)
+        session.auth = "victim"
+        session._try_store_in_db(request, response)
+
+        _, _, session2 = self._connect(
+            "1.1.1.1", session_id=response.session_id, db=db
+        )
+        self.assertEqual(session2.get("auth"), "victim")
 
 
 class testFileUpload(unittest.TestCase):
@@ -339,7 +963,9 @@ class testFileUpload(unittest.TestCase):
             "CONTENT_LENGTH": str(len(body)),
             "wsgi.input": BytesIO(body),
         }
-        return Request(env)
+        r = Request(env)
+        self.addCleanup(lambda: r._body.close() if r._body is not None else None)
+        return r
 
     def test_file_upload_filename(self):
         body = self._build_multipart(files={"upload": ("hello.txt", b"hello world")})
@@ -392,3 +1018,81 @@ class testFileUpload(unittest.TestCase):
         filenames = [u.filename for u in uploads]
         self.assertIn("a.txt", filenames)
         self.assertIn("b.txt", filenames)
+
+    def _make_request_with_content_type(self, body, content_type):
+        env = {
+            "request_method": "POST",
+            "CONTENT_TYPE": content_type,
+            "CONTENT_LENGTH": str(len(body)),
+            "wsgi.input": BytesIO(body),
+        }
+        r = Request(env)
+        self.addCleanup(lambda: r._body.close() if r._body is not None else None)
+        return r
+
+    def test_missing_boundary_does_not_raise(self):
+        # A multipart/form-data Content-Type with no boundary parameter must not
+        # blow up the request parser (previously raised TypeError -> HTTP 500).
+        r = self._make_request_with_content_type(
+            b"whatever", "multipart/form-data"
+        )
+        self.assertEqual(dict(r.post_vars), {})
+
+    def test_invalid_part_charset_does_not_raise(self):
+        # An attacker-controlled, unknown charset in a part header must not
+        # escape as a LookupError -> HTTP 500. Parsing degrades gracefully.
+        boundary = self.BOUNDARY
+        body = (
+            b"--" + boundary + b"\r\n"
+            b'Content-Disposition: form-data; name="a"\r\n'
+            b"Content-Type: text/plain; charset=bogus-enc\r\n\r\nhello\r\n"
+            b"--" + boundary + b"--\r\n"
+        )
+        r = self._make_request(body)
+        # access must not raise; the undecodable part is simply dropped
+        self.assertNotIn("a", r.post_vars)
+
+    def test_too_many_parts_does_not_raise(self):
+        # Exceeding the parser's part limit raises ParserLimitReached (a sibling
+        # of ParserError), which previously escaped as HTTP 500. The request now
+        # degrades to the parts decoded before the limit was hit.
+        boundary = self.BOUNDARY
+        body = b""
+        for i in range(200):
+            body += (
+                b"--" + boundary + b"\r\n"
+                b'Content-Disposition: form-data; name="f' + str(i).encode() + b'"\r\n'
+                b"\r\nv\r\n"
+            )
+        body += b"--" + boundary + b"--\r\n"
+        r = self._make_request(body)
+        # no exception; some fields were captured before the limit was reached
+        self.assertTrue(len(r.post_vars) > 0)
+
+    def test_truncated_body_keeps_partial_fields(self):
+        # A body that ends before the closing boundary raises a ParserError on
+        # close; the historical lenient behaviour (keep what was parsed) must be
+        # preserved.
+        boundary = self.BOUNDARY
+        body = (
+            b"--" + boundary + b"\r\n"
+            b'Content-Disposition: form-data; name="ok"\r\n\r\ngood\r\n'
+            b"--" + boundary + b"\r\n"
+            b'Content-Disposition: form-data; name="truncated"\r\n\r\nincomp'
+        )
+        r = self._make_request(body)
+        self.assertEqual(r.post_vars.get("ok"), "good")
+
+    def test_malicious_content_type_does_not_redos(self):
+        # The Content-Type header is parsed (parse_options_header) on every
+        # multipart POST before any authentication. An unterminated quoted
+        # boundary value made of backslashes used to backtrack exponentially
+        # in the option-value regex, so a tiny header could burn minutes of
+        # CPU. Parsing such a header must now stay fast.
+        import time
+
+        content_type = "multipart/form-data; boundary=" + '"' + "\\" * 64
+        start = time.time()
+        r = self._make_request_with_content_type(b"whatever", content_type)
+        self.assertEqual(dict(r.post_vars), {})
+        self.assertLess(time.time() - start, 5)

@@ -213,11 +213,46 @@ def cleanpath(path):
     return path
 
 
+def _is_within_path(target, root):
+    return target == root or target.startswith(root + os.sep)
+
+
 def _extractall(filename, path=".", members=None):
+    path = os.path.abspath(path)
     tar = tarfile.TarFile(filename, "r")
-    ret = tar.extractall(path, members)
-    tar.close()
-    return ret
+    try:
+        safe_members = []
+        for member in members or tar.getmembers():
+            # Check for path traversal and absolute paths
+            target = os.path.abspath(os.path.join(path, member.name))
+            if os.path.isabs(member.name):
+                raise RuntimeError("Attempted path traversal in tar file")
+            try:
+                safe_path_join(path, member.name)
+            except ValueError:
+                raise RuntimeError("Attempted path traversal in tar file")
+
+            # Check for unsafe special files (devices, FIFOs)
+            if member.isdev() or member.isfifo():
+                raise RuntimeError("Attempted unsafe special file in tar file")
+
+            # Check for symlinks/hardlinks escaping extraction root
+            if member.issym():
+                link_target = member.linkname
+                if not os.path.isabs(link_target):
+                    link_target = os.path.join(os.path.dirname(target), link_target)
+                link_target = os.path.abspath(link_target)
+                if not _is_within_path(link_target, path):
+                    raise RuntimeError("Attempted path traversal in tar file")
+            elif member.islnk():
+                link_target = os.path.abspath(os.path.join(path, member.linkname))
+                if not _is_within_path(link_target, path):
+                    raise RuntimeError("Attempted path traversal in tar file")
+
+            safe_members.append(member)
+        return tar.extractall(path, safe_members)
+    finally:
+        tar.close()
 
 
 def tar(file, dir, expression="^.+$", filenames=None, exclude_content_from=None):
@@ -430,6 +465,48 @@ def set_session(request, session, other_application="admin"):
     storage.save_storage(session, session_filename)
 
 
+def _session_auth_user(session):
+    auth = session.get("auth")
+    if not auth:
+        return None
+    return auth.get("user")
+
+
+def _check_admin_app_ownership(request, session):
+    """Checks multi-user admin ownership before authorizing appadmin."""
+    if request.application == "admin":
+        return True
+
+    user = _session_auth_user(session)
+    if not user:
+        return True
+
+    user_id = user.get("id")
+    if user_id == 1 or user.get("is_manager"):
+        return True
+
+    db = None
+    try:
+        from gluon.dal import DAL
+
+        admin_db_folder = safe_path_join(up(request.folder), "admin", "databases")
+        db = DAL(
+            "sqlite://storage.sqlite",
+            folder=admin_db_folder,
+            auto_import=True,
+            migrate=False,
+        )
+        if "app" not in db.tables:
+            return False
+        query = (db.app.name == request.application) & (db.app.owner == user_id)
+        return bool(db(query).count())
+    except Exception:
+        return False
+    finally:
+        if db is not None:
+            db.close()
+
+
 def check_credentials(
     request, other_application="admin", expiration=60 * 60, gae_login=True
 ):
@@ -452,6 +529,8 @@ def check_credentials(
         dt = t0 - expiration
         s = get_session(request, other_application)
         r = s.authorized and s.last_time and s.last_time > dt
+        if r and other_application == "admin":
+            r = _check_admin_app_ownership(request, s)
         if r:
             s.last_time = t0
             set_session(request, s, other_application)
